@@ -32,6 +32,7 @@ func BankWithKeys(ctx context.Context, pool *pgxpool.Pool, readToken, instructio
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /bank/health", health(pool))
+	mux.HandleFunc("GET /bank/settlement-timing", require(readToken, settlementTiming[bankTimingRecord](pool, bankTimingQuery)))
 	mux.HandleFunc("POST /bank/instructions", require(instructionToken, func(w http.ResponseWriter, r *http.Request) {
 		var i bankInstruction
 		if err := readJSON(r, &i); err != nil {

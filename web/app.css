@@ -106,10 +106,36 @@ td,th { overflow-wrap:anywhere; } .data-table tbody tr:hover { background:#f6f7e
 .payout-item summary .amount { margin-inline:.55rem; }
 .payout-detail { margin-top:.7rem; }
 .payout-detail .actions { margin-top:.6rem; }
+.timing-actions { margin:.65rem 0; }
+.timing-replay { margin:.8rem 0; border-bottom:1px solid var(--line); padding-bottom:.8rem; }
+.timing-replay summary { cursor:pointer; font-weight:600; }
+.timing-replay input { font-variant-numeric:tabular-nums; }
+.timing-age { color:var(--muted); font-size:.8rem; }
+.timing-items { list-style:none; padding:0; margin:.5rem 0; }
+.timing-items li { border-top:1px solid var(--line); padding:.75rem 0; }
+.timing-items summary,.timing-matches > summary { cursor:pointer; }
+.timing-summary { display:inline-flex; flex-wrap:wrap; align-items:center; gap:.25rem .65rem; vertical-align:middle; }
+.timing-amount,.timing-age { font-variant-numeric:tabular-nums; }
+.timing-amount { font-size:.87rem; }
+.timing-trace { overflow-wrap:anywhere; }
+.timing-items .details { margin:.55rem 0 .1rem; }
+.timing-matches { border-top:1px solid var(--line); margin-top:1rem; padding-top:.75rem; }
+.timing-matches > summary { font-weight:600; }
+.fee-reports li { align-items:center; }
+.fee-reports li div { min-width:0; overflow-wrap:anywhere; }
+.fee-reports button { flex:none; }
+.fee-lines { list-style:none; padding:0; margin:.6rem 0 0; }
+.fee-lines li { border-top:1px solid var(--line); padding:.75rem 0; }
+.fee-lines summary { cursor:pointer; overflow-wrap:anywhere; }
+.fee-lines summary .sub { display:inline; margin-left:.3rem; }
+.fee-amounts { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.5rem; margin-top:.4rem; }
+.fee-amounts dt { color:var(--muted); font-size:.73rem; }
+.fee-amounts dd { margin:0; font-size:.9rem; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
 .payment-grid { display:grid; grid-template-columns:1fr 1fr; gap:.6rem 1rem; }
 .details { margin:1rem 0; } .details div { display:flex; justify-content:space-between; gap:.8rem; align-items:baseline; padding:.5rem 0; border-bottom:1px solid var(--line); }
 .details dt { color:var(--muted); font-size:.83rem; flex:none; } .details dd { font-size:.84rem; font-weight:550; text-align:right; overflow-wrap:anywhere; }
 dialog { border:1px solid #a8b5a6; background:var(--surface); color:var(--ink); width:min(31rem,calc(100% - 1.75rem)); max-height:calc(100dvh - 2rem); padding:0; border-radius:.65rem; box-shadow:0 20px 100px #162a2255; }
+dialog:has(#fee-comparison),dialog:has(#timing-queue) { width:min(41rem,calc(100% - 1.75rem)); }
 dialog::backdrop { background:#172d25aa; }
 #dialog-content { padding:1.5rem; }
 .dialog-head { display:flex; align-items:start; justify-content:space-between; gap:1rem; margin-bottom:.9rem; }

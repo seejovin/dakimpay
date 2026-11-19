@@ -25,9 +25,9 @@ dt{color:#596660}dd{margin:0;text-align:right;overflow-wrap:anywhere}.total dd{f
 button{width:100%;color:#fff;background:#194b3b;border:0;border-radius:7px;padding:14px;font-size:15px;font-weight:600;cursor:pointer}button:focus-visible{outline:3px solid #b17921;outline-offset:3px}
 </style></head>
 <body><main><header><strong>Mimi</strong><span>Simulated acquirer</span></header><section>
-{{if eq .Status "captured"}}<h1>Payment approved</h1><p>Return to dakim pay and check the payment status. The acquirer has recorded this simulated capture.</p>{{else}}<h1>Approve your payment</h1><p>This hosted checkout uses a test instrument. Select approve to simulate the issuer’s decision.</p>{{end}}
+{{if eq .Status "captured"}}<h1>Payment approved</h1><p>Return to dakim pay and check the payment status. The acquirer has recorded this simulated capture.</p>{{else if eq .Status "expired"}}<h1>Checkout expired</h1><p>The acquirer closed this checkout unpaid. Return to Mimi for help with this order.</p>{{else}}<h1>Approve your payment</h1><p>This hosted checkout uses a test instrument. Select approve to simulate the issuer’s decision.</p>{{end}}
 <dl><div><dt>Merchant</dt><dd>Mimi</dd></div><div><dt>Order</dt><dd>{{.Order}}</dd></div><div><dt>Test instrument</dt><dd>{{brand .Brand}}</dd></div><div class="total"><dt>Total · USD</dt><dd>{{money .Amount}}</dd></div></dl>
-{{if eq .Status "captured"}}<p>Acquirer reference</p><p style="overflow-wrap:anywhere">{{.Reference}}</p>{{else}}<form method="post"><button type="submit">Approve simulated payment</button></form>{{end}}
+{{if eq .Status "awaiting_customer"}}<form method="post"><button type="submit">Approve simulated payment</button></form>{{else}}<p>Acquirer reference</p><p style="overflow-wrap:anywhere">{{.Reference}}</p>{{end}}
 </section></main></body></html>`))
 
 func (a *acquirer) checkout(w http.ResponseWriter, r *http.Request) {
@@ -42,9 +42,9 @@ func (a *acquirer) checkout(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		c, err = a.approve(r.Context(), "", r.PathValue("capability"))
+		c, err = a.lookupCharge(r.Context(), "", r.PathValue("capability"), true)
 	} else {
-		c, err = a.readCharge(a.pool.QueryRow(r.Context(), "select "+chargeFields+" from sim_charge where checkout_token=$1", r.PathValue("capability")))
+		c, err = a.lookupCharge(r.Context(), "", r.PathValue("capability"), false)
 	}
 	if err != nil {
 		respondError(w, err)
@@ -54,5 +54,8 @@ func (a *acquirer) checkout(w http.ResponseWriter, r *http.Request) {
 	// the same-origin form's provenance while omitting external referrers.
 	w.Header().Set("Referrer-Policy", "same-origin")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if c.Status == "expired" {
+		w.WriteHeader(http.StatusGone)
+	}
 	_ = checkoutPage.Execute(w, c)
 }

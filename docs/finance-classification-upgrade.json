@@ -1,0 +1,130 @@
+{
+  "source": "disposable pre-reporting Mimi snapshot with a matched later debit",
+  "latest_migration": "145_refund_classification.sql",
+  "historical_financial_records_before": {
+    "register_receipt": {
+      "count": 1,
+      "sha256": "4314ed31b655213bf4b47a8f6d104aee2333fe3f1c5a27c5287f30e55ded6d71"
+    },
+    "register_refund": {
+      "count": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "card_attempt": {
+      "count": 1,
+      "sha256": "24818845ab2b70643336edcefeb819dbfdd6d94c6b46c206a24154633ff8851b"
+    },
+    "stock_move": {
+      "count": 13,
+      "sha256": "e00a1ba5c75d293856c3a9a565a048f585bdb140a3b47b09113527a7f2d9a3ef"
+    },
+    "stock": {
+      "count": 18,
+      "sha256": "6d7874dbbd5333cfc5b22e500143d167869922d67bf7702ab0d8198294305c65"
+    },
+    "lot_balance": {
+      "count": 12,
+      "sha256": "1b43dd6571f32fcfe1fccbdea1746587e0724522ee626eda49f945c71556261d"
+    },
+    "credit_entry": {
+      "count": 1,
+      "sha256": "36261a8811f2ae262efc4364f5ddeaeacc5a942a12f13a29e65a5cc6cf763e5a"
+    },
+    "settlement_batch": {
+      "count": 2,
+      "sha256": "d1623309e8e103559a6faa843f6e85f8b80e3cb282fd91bf68c0d2af7fea9334"
+    },
+    "settlement_line": {
+      "count": 2,
+      "sha256": "6271c830570b18740212fe75aea8a5c8f60ef2b489d24b78ef219c8d8c1d4f3a"
+    },
+    "settlement_journal": {
+      "count": 5,
+      "sha256": "09bb2454f258cb95ef8b7acfd795c5caca21603dab20b2a570ae442515013391"
+    },
+    "tender_journal": {
+      "count": 10,
+      "sha256": "560a6197a23f529c051eaa3f5a80974dc5ea75af57be929deb2f105384e76e1e"
+    },
+    "provider_refund_notice": {
+      "count": 1,
+      "sha256": "a402c7402c0e3a1b7e041877cca98d8ae1e1c5d26762ce2148d70a0994f3dd6d"
+    },
+    "provider_refund_applied": {
+      "count": 1,
+      "sha256": "0651cfb69c528ea44fd61037af109d6c2747c8fe7d127131e64073dcee9c5f03"
+    },
+    "provider_statement_check": {
+      "count": 1,
+      "sha256": "15ef314b728400d45dd67459575d6b4bb2e525240813f22ab87a4bf9fc694a35"
+    },
+    "settlement_applied": {
+      "count": 1,
+      "sha256": "def4720287c0fe03a4a86e79c558267fc04b76236f10b887c394d4f07e4ee359"
+    }
+  },
+  "historical_financial_records_after": {
+    "register_receipt": {
+      "count": 1,
+      "sha256": "4314ed31b655213bf4b47a8f6d104aee2333fe3f1c5a27c5287f30e55ded6d71"
+    },
+    "register_refund": {
+      "count": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "card_attempt": {
+      "count": 1,
+      "sha256": "24818845ab2b70643336edcefeb819dbfdd6d94c6b46c206a24154633ff8851b"
+    },
+    "stock_move": {
+      "count": 13,
+      "sha256": "e00a1ba5c75d293856c3a9a565a048f585bdb140a3b47b09113527a7f2d9a3ef"
+    },
+    "stock": {
+      "count": 18,
+      "sha256": "6d7874dbbd5333cfc5b22e500143d167869922d67bf7702ab0d8198294305c65"
+    },
+    "lot_balance": {
+      "count": 12,
+      "sha256": "1b43dd6571f32fcfe1fccbdea1746587e0724522ee626eda49f945c71556261d"
+    },
+    "credit_entry": {
+      "count": 1,
+      "sha256": "36261a8811f2ae262efc4364f5ddeaeacc5a942a12f13a29e65a5cc6cf763e5a"
+    },
+    "settlement_batch": {
+      "count": 2,
+      "sha256": "d1623309e8e103559a6faa843f6e85f8b80e3cb282fd91bf68c0d2af7fea9334"
+    },
+    "settlement_line": {
+      "count": 2,
+      "sha256": "6271c830570b18740212fe75aea8a5c8f60ef2b489d24b78ef219c8d8c1d4f3a"
+    },
+    "settlement_journal": {
+      "count": 5,
+      "sha256": "09bb2454f258cb95ef8b7acfd795c5caca21603dab20b2a570ae442515013391"
+    },
+    "tender_journal": {
+      "count": 10,
+      "sha256": "560a6197a23f529c051eaa3f5a80974dc5ea75af57be929deb2f105384e76e1e"
+    },
+    "provider_refund_notice": {
+      "count": 1,
+      "sha256": "a402c7402c0e3a1b7e041877cca98d8ae1e1c5d26762ce2148d70a0994f3dd6d"
+    },
+    "provider_refund_applied": {
+      "count": 1,
+      "sha256": "0651cfb69c528ea44fd61037af109d6c2747c8fe7d127131e64073dcee9c5f03"
+    },
+    "provider_statement_check": {
+      "count": 1,
+      "sha256": "15ef314b728400d45dd67459575d6b4bb2e525240813f22ab87a4bf9fc694a35"
+    },
+    "settlement_applied": {
+      "count": 1,
+      "sha256": "def4720287c0fe03a4a86e79c558267fc04b76236f10b887c394d4f07e4ee359"
+    }
+  },
+  "eligible_cases": 1,
+  "approved_classifications_created_by_upgrade": 0
+}

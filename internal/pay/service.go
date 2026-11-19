@@ -25,10 +25,15 @@ import (
 //go:embed schema.sql
 var schema string
 
+//go:embed refund_balance.sql
+var refundBalanceSchema string
+
 type Service struct {
 	db                    *pgxpool.Pool
 	acquirer, bank, token string
 	client                *http.Client
+	lookupRefund          func(context.Context, string, string) (sourceRefund, bool, error)
+	timingNow             func() time.Time
 }
 
 func New(ctx context.Context, pool *pgxpool.Pool, acquirerURL, bankURL, serviceToken string) (*Service, error) {
@@ -41,10 +46,13 @@ func New(ctx context.Context, pool *pgxpool.Pool, acquirerURL, bankURL, serviceT
 			return nil, errors.New("invalid simulator origin")
 		}
 	}
-	if _, err := pool.Exec(ctx, schema); err != nil {
+	if _, err := pool.Exec(ctx, schema+"\n"+refundBalanceSchema+"\n"+timingObservationSchema); err != nil {
 		return nil, err
 	}
-	return &Service{db: pool, acquirer: strings.TrimRight(acquirerURL, "/"), bank: strings.TrimRight(bankURL, "/"), token: serviceToken, client: &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+	service := &Service{db: pool, acquirer: strings.TrimRight(acquirerURL, "/"), bank: strings.TrimRight(bankURL, "/"), token: serviceToken, client: &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	service.lookupRefund = service.lookupSimulatorRefund
+	service.timingNow = time.Now
+	return service, nil
 }
 
 type failure struct {
@@ -92,12 +100,18 @@ func (s *Service) Handler() http.Handler {
 	m.HandleFunc("GET /v1/dashboard", endpoint(s.dashboard))
 	m.HandleFunc("POST /v1/payments", endpoint(s.createPayment))
 	m.HandleFunc("GET /v1/payments/{id}", endpoint(s.getPayment))
+	m.HandleFunc("GET /v1/payments/{id}/reversal-evidence", endpoint(s.reversalEvidence))
 	m.HandleFunc("POST /v1/payments/{id}/recover", endpoint(s.recover))
 	m.HandleFunc("POST /v1/payments/{id}/refunds", endpoint(s.refund))
 	m.HandleFunc("GET /v1/refunds/{id}", endpoint(s.getRefund))
+	m.HandleFunc("GET /v1/adjustments", endpoint(s.listAdjustments))
 	m.HandleFunc("POST /v1/refunds/{id}/recover", endpoint(s.recoverRefund))
 	m.HandleFunc("POST /v1/settle", endpoint(s.settle))
 	m.HandleFunc("GET /v1/payouts/{id}/statement", endpoint(s.merchantStatement))
+	m.HandleFunc("GET /v1/settlements/{id}/fee-report", endpoint(s.feeReport))
+	m.HandleFunc("GET /v1/settlement-timing", endpoint(s.settlementTiming))
+	m.HandleFunc("GET /v1/settlement-timing/history", endpoint(s.timingHistory))
+	m.HandleFunc("POST /v1/settlement-timing/observations", endpoint(s.observeTiming))
 	m.HandleFunc("POST /v1/reconcile", endpoint(s.reconcile))
 	return m
 }
@@ -156,8 +170,15 @@ func (s *Service) remote(ctx context.Context, base, method, path string, body, o
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return resp.StatusCode, fmt.Errorf("simulator response %d", resp.StatusCode)
 	}
-	d := json.NewDecoder(io.LimitReader(resp.Body, 4<<20))
-	if err = d.Decode(out); err != nil {
+	const maxResponseBytes = 4 << 20
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return resp.StatusCode, err
+	}
+	if len(payload) > maxResponseBytes {
+		return resp.StatusCode, errors.New("simulator response exceeds the size limit")
+	}
+	if err = json.Unmarshal(payload, out); err != nil {
 		return resp.StatusCode, err
 	}
 	return resp.StatusCode, nil
@@ -168,7 +189,11 @@ type sqlDB interface {
 	Query(context.Context, string, ...any) (pgx.Rows, error)
 }
 
-func note(ctx context.Context, tx pgx.Tx, subject, kind, msg string) error {
-	_, err := tx.Exec(ctx, "INSERT INTO pay.events(subject,kind,message) VALUES ($1,$2,$3) ON CONFLICT (subject,kind) DO NOTHING", subject, kind, msg)
+type eventWriter interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func note(ctx context.Context, db eventWriter, subject, kind, msg string) error {
+	_, err := db.Exec(ctx, "INSERT INTO pay.events(subject,kind,message) VALUES ($1,$2,$3) ON CONFLICT (subject,kind) DO NOTHING", subject, kind, msg)
 	return err
 }

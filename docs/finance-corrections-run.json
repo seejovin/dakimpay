@@ -1,0 +1,391 @@
+{
+  "environment": "local simulated acquirer and bank; disposable Mimi store",
+  "verified_at": "2026-11-19T13:47:35.380789+00:00",
+  "currency": "USD",
+  "units": "cents",
+  "receipt": "48171f08-f949-46e8-8525-194792f0d215",
+  "capture": {
+    "payment": "dp_08a84c3a8cee3ad7675d810ea1e19ac8",
+    "reference": "ch_b25cdee9-099c-48c9-89fa-feee28457af2",
+    "amount": 360
+  },
+  "original_payout": "po_a9fff860-6380-4f7a-881d-c7c5f3900328",
+  "original_bank_entry": {
+    "trace": "bt_2f8651b8-a03e-4400-83ce-25b7b557c2b4",
+    "merchant_id": "mimi",
+    "currency": "USD",
+    "amount": 353,
+    "status": "posted"
+  },
+  "source_refund": {
+    "operation_id": "sr_00903894365a4e2580d6398629f16ca2",
+    "charge_reference": "ch_b25cdee9-099c-48c9-89fa-feee28457af2",
+    "amount": 120,
+    "merchant_id": "mimi",
+    "currency": "USD",
+    "reference": "rf_b19917a9-7124-4ea2-8d9f-455419760fd7",
+    "status": "succeeded",
+    "payment_id": "dp_08a84c3a8cee3ad7675d810ea1e19ac8",
+    "origin": "acquirer",
+    "occurred_at": "2026-11-19T13:47:04.659038Z"
+  },
+  "finance_exception": {
+    "id": "dr_fb62c5eac62c16f2bcbdea756d77108b",
+    "sequence": 1,
+    "receipt": "48171f08-f949-46e8-8525-194792f0d215",
+    "original_bank": "bt_2f8651b8-a03e-4400-83ce-25b7b557c2b4",
+    "original_deposit_minor": 353,
+    "states": [
+      "awaiting_bank",
+      "bank_matched"
+    ],
+    "count_after_replay": 1
+  },
+  "later_statement": {
+    "bank": "bt_e2b6fe0b-e731-4f0f-b24c-898161b0b1c0",
+    "currency": "USD",
+    "depositMinor": -120,
+    "lines": [
+      {
+        "reference": "dr_fb62c5eac62c16f2bcbdea756d77108b",
+        "grossMinor": -120,
+        "feeMinor": 0,
+        "kind": "provider_refund",
+        "original": "dp_08a84c3a8cee3ad7675d810ea1e19ac8"
+      }
+    ],
+    "payout": "po_ed022b65-ba3d-4e11-9123-a9a7592caa9c"
+  },
+  "later_bank_lookup_http_before_post": 404,
+  "later_bank_after_post": {
+    "trace": "bt_e2b6fe0b-e731-4f0f-b24c-898161b0b1c0",
+    "merchant_id": "mimi",
+    "currency": "USD",
+    "amount": -120,
+    "status": "posted"
+  },
+  "original_settlement_journal": [
+    "bank|353",
+    "card_clearing|-360",
+    "processing_fees|7"
+  ],
+  "later_settlement_journal": [
+    "bank|-120",
+    "provider_refund_suspense|120"
+  ],
+  "original_record_sha256_before": "9ab64b022fcb04af8157ace28827e5d758c01ac4f7bd06a62bfcfe4786a2fdf0",
+  "original_record_sha256_after": "9ab64b022fcb04af8157ace28827e5d758c01ac4f7bd06a62bfcfe4786a2fdf0",
+  "premature_close_http": 409,
+  "self_approval_http": 403,
+  "service_restarts": 5,
+  "reporting_classification": {
+    "scope": "reporting-only; no financial journal entry or payment instruction",
+    "proposal": "6794d2be-0b64-4539-be2e-f0ddb73809c7",
+    "original_proposal": "04874c6a-27e6-484e-a812-43cdc348c56d",
+    "adjustment": "dr_fb62c5eac62c16f2bcbdea756d77108b",
+    "debit_batch": "b5cbc639-dd65-47b5-bbc6-a9cf69a03359",
+    "category": "merchant_funded_service_concession",
+    "reason": "Mimi approved a service concession for missed assistance documented by the store supervisor.",
+    "evidence_ref": "MIMI-SIGNED-SERVICE-LOG-dr_fb62c5eac62c16f2bcbdea756d77108b",
+    "proposed_by": "a1ab3c5c-645e-446d-a8a3-5435e9659bd3",
+    "proposed_at": "2026-11-19T21:47:32.325161+08:00",
+    "approved_by": "5fcca899-d380-4ecb-8fcd-01e73d761bf6",
+    "approved_at": "2026-11-19T21:47:32.792213+08:00",
+    "classification_states": [
+      "unclassified",
+      "pending_approval",
+      "returned",
+      "pending_approval",
+      "approved"
+    ],
+    "classification_history": [
+      {
+        "approvedAt": null,
+        "approvedBy": null,
+        "approvedByName": null,
+        "category": "merchant_funded_service_concession",
+        "classificationStatus": "returned",
+        "evidenceRef": "MIMI-SYNTHETIC-CASE-dr_fb62c5eac62c16f2bcbdea756d77108b",
+        "proposalId": "04874c6a-27e6-484e-a812-43cdc348c56d",
+        "proposedAt": "2026-11-19T13:47:27.510889+00:00",
+        "proposedBy": "a1ab3c5c-645e-446d-a8a3-5435e9659bd3",
+        "proposedByName": "Finance operator",
+        "reason": "Mimi agreed to a partial service concession following a documented delivery delay.",
+        "returnEvidenceRef": "MIMI-REVIEW-LOG-dr_fb62c5eac62c16f2bcbdea756d77108b",
+        "returnReason": "The draft cites a delivery delay; the customer service log records missed assistance.",
+        "returnedAt": "2026-11-19T13:47:29.924488+00:00",
+        "returnedBy": "5fcca899-d380-4ecb-8fcd-01e73d761bf6",
+        "returnedByName": "Shift supervisor",
+        "revision": 1,
+        "supersedesId": null
+      },
+      {
+        "approvedAt": "2026-11-19T13:47:32.792213+00:00",
+        "approvedBy": "5fcca899-d380-4ecb-8fcd-01e73d761bf6",
+        "approvedByName": "Shift supervisor",
+        "category": "merchant_funded_service_concession",
+        "classificationStatus": "approved",
+        "evidenceRef": "MIMI-SIGNED-SERVICE-LOG-dr_fb62c5eac62c16f2bcbdea756d77108b",
+        "proposalId": "6794d2be-0b64-4539-be2e-f0ddb73809c7",
+        "proposedAt": "2026-11-19T13:47:32.325161+00:00",
+        "proposedBy": "a1ab3c5c-645e-446d-a8a3-5435e9659bd3",
+        "proposedByName": "Finance operator",
+        "reason": "Mimi approved a service concession for missed assistance documented by the store supervisor.",
+        "returnEvidenceRef": null,
+        "returnReason": null,
+        "returnedAt": null,
+        "returnedBy": null,
+        "returnedByName": null,
+        "revision": 2,
+        "supersedesId": "04874c6a-27e6-484e-a812-43cdc348c56d"
+      }
+    ],
+    "self_return_http": 403,
+    "stale_approval_http": 409,
+    "approved_version_return_http": 409,
+    "return_note_rewrite_http": 409,
+    "uncorrected_resubmission_http": 409,
+    "concurrent_correction_submissions": 2,
+    "successful_return_audit_entries": 1,
+    "premature_proposal_http": 409,
+    "self_approval_http": 403,
+    "wrong_proposal_http": 409,
+    "changed_proposal_terms_http": 409,
+    "concurrent_approval_submissions": 6,
+    "classification_proposals": 2,
+    "classification_returns": 1,
+    "classification_approvals": 1,
+    "matched_debits": 1,
+    "successful_approval_audit_entries": 1,
+    "financial_fingerprints_before": {
+      "mimi": {
+        "basket_item": {
+          "rows": 1,
+          "sha256": "5cecfd1a107b0e8fbd9aac3956850fd5eed6b0087a6cadd979c4a741235e611f"
+        },
+        "card_attempt": {
+          "rows": 1,
+          "sha256": "e1807d11f90cc73ae0def49dfe145f85b7f000dfe5f16f85928f92553b34804a"
+        },
+        "credit_entry": {
+          "rows": 1,
+          "sha256": "f89ee695a161910d35ce641d9288de2d97c7899801e5ceae434b3a08f2d2f0d2"
+        },
+        "lot_balance": {
+          "rows": 12,
+          "sha256": "ea0b6021e28eb7246fd2a91bd77f1a5f88b8db7eb2c0e43dd2442af59e1405f9"
+        },
+        "provider_refund_applied": {
+          "rows": 1,
+          "sha256": "99d6a07bf1bdceb23efbb979f1bd28b42f2c67304d7a9569402959b10d46213a"
+        },
+        "provider_refund_notice": {
+          "rows": 1,
+          "sha256": "fb3ef98ef914ad75e24e2d8dcd1ffdd8cdf6782405e418d16b2de22b5de23bce"
+        },
+        "register_receipt": {
+          "rows": 1,
+          "sha256": "9f49b792d2d2fcdcf3f308ccda3aabb4d2635fc392ab7622bae338189b7d3d78"
+        },
+        "register_refund": {
+          "rows": 0,
+          "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "sale_basket": {
+          "rows": 1,
+          "sha256": "7a22d6af69a28632e8ab094815e10e55aae473651e6e5c60ba8965dddd0abe3a"
+        },
+        "settlement_batch": {
+          "rows": 2,
+          "sha256": "f85b68ad391e8a58aed694b3ee24656b4702acdb866f64a928ab5dfe122b0580"
+        },
+        "settlement_journal": {
+          "rows": 5,
+          "sha256": "f8f3fc1e210c1ae6c7c86433a4ccaa75739896337111baeecfc01f97f3d70b10"
+        },
+        "settlement_line": {
+          "rows": 2,
+          "sha256": "4bb2c2f34a1733c772e29af565e6fbf1f4f9e0ebd682f91ea3ae594ccc8c4928"
+        },
+        "stock": {
+          "rows": 18,
+          "sha256": "d63a786957e0ca94fec86967e529c9a59d83c19a7e70386f92353a01c25e1912"
+        },
+        "stock_move": {
+          "rows": 13,
+          "sha256": "d308b03175dc5463bbcac01bbb8a8f2074840b02d2fe22608fcb92e74115b2d6"
+        },
+        "tender_journal": {
+          "rows": 10,
+          "sha256": "a1b2be083d65543f00a0f1ce040ff87904bea2ddc8a4305571aa5958db1c2b85"
+        }
+      },
+      "dakim_pay": {
+        "pay.lines": {
+          "rows": 3,
+          "sha256": "5ed152e5d1a4a9374be741ead8b7949c2a7d97807ceff1138a74b6ffa2fa15a3"
+        },
+        "pay.payments": {
+          "rows": 1,
+          "sha256": "67420c190e90dcf10bfe08a2566f76aface8b4f473e8687f0aadfc34d4aad6ee"
+        },
+        "pay.payouts": {
+          "rows": 2,
+          "sha256": "3a83200e86b353e147c049066a81fb976b907b059a7632537b7570cc34fb3594"
+        },
+        "pay.refunds": {
+          "rows": 1,
+          "sha256": "9795f1b443df3469132ef9cb6b3de1ce9a40a4ff176bc7b191d8fedb8031fe2f"
+        },
+        "pay.settlement_requests": {
+          "rows": 2,
+          "sha256": "1a569d585b8333f64d26b028557168a6f5f8799b5bba8b945b45934609533f25"
+        }
+      },
+      "acquirer": {
+        "sim_charge": {
+          "rows": 1,
+          "sha256": "d444373c61d64a7bfe2d818a31061aa3efb31e8e7b623f8bfb6dfda506a31cfe"
+        },
+        "sim_line": {
+          "rows": 3,
+          "sha256": "89e4f961e1a41fed660c4e221397cc08ac74bb16aadb147e50b7b433c5b2b9f8"
+        },
+        "sim_payout": {
+          "rows": 2,
+          "sha256": "90ec5bf4ca072b229489a9b554ed1a599a330240a7e25284b0899b762fbc422e"
+        },
+        "sim_refund": {
+          "rows": 1,
+          "sha256": "9083388eb1b5094f5e5a7367ee8cbd024b3360a6ad323332baf6c7d83ab9d3eb"
+        },
+        "sim_refund_decline": {
+          "rows": 0,
+          "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        }
+      },
+      "bank": {
+        "sim_bank_entry": {
+          "rows": 2,
+          "sha256": "d9315ec403f4f5a46c099080f13817a47d98bcdfcb24197f78d6de2cf68cb2a5"
+        }
+      }
+    },
+    "financial_fingerprints_after": {
+      "mimi": {
+        "basket_item": {
+          "rows": 1,
+          "sha256": "5cecfd1a107b0e8fbd9aac3956850fd5eed6b0087a6cadd979c4a741235e611f"
+        },
+        "card_attempt": {
+          "rows": 1,
+          "sha256": "e1807d11f90cc73ae0def49dfe145f85b7f000dfe5f16f85928f92553b34804a"
+        },
+        "credit_entry": {
+          "rows": 1,
+          "sha256": "f89ee695a161910d35ce641d9288de2d97c7899801e5ceae434b3a08f2d2f0d2"
+        },
+        "lot_balance": {
+          "rows": 12,
+          "sha256": "ea0b6021e28eb7246fd2a91bd77f1a5f88b8db7eb2c0e43dd2442af59e1405f9"
+        },
+        "provider_refund_applied": {
+          "rows": 1,
+          "sha256": "99d6a07bf1bdceb23efbb979f1bd28b42f2c67304d7a9569402959b10d46213a"
+        },
+        "provider_refund_notice": {
+          "rows": 1,
+          "sha256": "fb3ef98ef914ad75e24e2d8dcd1ffdd8cdf6782405e418d16b2de22b5de23bce"
+        },
+        "register_receipt": {
+          "rows": 1,
+          "sha256": "9f49b792d2d2fcdcf3f308ccda3aabb4d2635fc392ab7622bae338189b7d3d78"
+        },
+        "register_refund": {
+          "rows": 0,
+          "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "sale_basket": {
+          "rows": 1,
+          "sha256": "7a22d6af69a28632e8ab094815e10e55aae473651e6e5c60ba8965dddd0abe3a"
+        },
+        "settlement_batch": {
+          "rows": 2,
+          "sha256": "f85b68ad391e8a58aed694b3ee24656b4702acdb866f64a928ab5dfe122b0580"
+        },
+        "settlement_journal": {
+          "rows": 5,
+          "sha256": "f8f3fc1e210c1ae6c7c86433a4ccaa75739896337111baeecfc01f97f3d70b10"
+        },
+        "settlement_line": {
+          "rows": 2,
+          "sha256": "4bb2c2f34a1733c772e29af565e6fbf1f4f9e0ebd682f91ea3ae594ccc8c4928"
+        },
+        "stock": {
+          "rows": 18,
+          "sha256": "d63a786957e0ca94fec86967e529c9a59d83c19a7e70386f92353a01c25e1912"
+        },
+        "stock_move": {
+          "rows": 13,
+          "sha256": "d308b03175dc5463bbcac01bbb8a8f2074840b02d2fe22608fcb92e74115b2d6"
+        },
+        "tender_journal": {
+          "rows": 10,
+          "sha256": "a1b2be083d65543f00a0f1ce040ff87904bea2ddc8a4305571aa5958db1c2b85"
+        }
+      },
+      "dakim_pay": {
+        "pay.lines": {
+          "rows": 3,
+          "sha256": "5ed152e5d1a4a9374be741ead8b7949c2a7d97807ceff1138a74b6ffa2fa15a3"
+        },
+        "pay.payments": {
+          "rows": 1,
+          "sha256": "67420c190e90dcf10bfe08a2566f76aface8b4f473e8687f0aadfc34d4aad6ee"
+        },
+        "pay.payouts": {
+          "rows": 2,
+          "sha256": "3a83200e86b353e147c049066a81fb976b907b059a7632537b7570cc34fb3594"
+        },
+        "pay.refunds": {
+          "rows": 1,
+          "sha256": "9795f1b443df3469132ef9cb6b3de1ce9a40a4ff176bc7b191d8fedb8031fe2f"
+        },
+        "pay.settlement_requests": {
+          "rows": 2,
+          "sha256": "1a569d585b8333f64d26b028557168a6f5f8799b5bba8b945b45934609533f25"
+        }
+      },
+      "acquirer": {
+        "sim_charge": {
+          "rows": 1,
+          "sha256": "d444373c61d64a7bfe2d818a31061aa3efb31e8e7b623f8bfb6dfda506a31cfe"
+        },
+        "sim_line": {
+          "rows": 3,
+          "sha256": "89e4f961e1a41fed660c4e221397cc08ac74bb16aadb147e50b7b433c5b2b9f8"
+        },
+        "sim_payout": {
+          "rows": 2,
+          "sha256": "90ec5bf4ca072b229489a9b554ed1a599a330240a7e25284b0899b762fbc422e"
+        },
+        "sim_refund": {
+          "rows": 1,
+          "sha256": "9083388eb1b5094f5e5a7367ee8cbd024b3360a6ad323332baf6c7d83ab9d3eb"
+        },
+        "sim_refund_decline": {
+          "rows": 0,
+          "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        }
+      },
+      "bank": {
+        "sim_bank_entry": {
+          "rows": 2,
+          "sha256": "d9315ec403f4f5a46c099080f13817a47d98bcdfcb24197f78d6de2cf68cb2a5"
+        }
+      }
+    },
+    "service_restarts_during_classification": 3
+  },
+  "concurrent_source_submissions": 4
+}

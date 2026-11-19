@@ -1,0 +1,155 @@
+{
+  "recorded_at_utc": "2026-11-19T14:19:25.998Z",
+  "test_environment": "Disposable three-process loopback installation with synthetic USD records",
+  "browser": "Chrome 142.0.7444.176",
+  "fixture": "Two unfunded synthetic fee lines varied by +5 and -5 cents before the simulated processor froze its statement. All monetary JSON amounts are USD cents.",
+  "matched_control": {
+    "payment_id": "dp_bde7094e30f228dc799144daf5c0114b",
+    "payout_id": "po_b4508cff-c336-4392-9227-4f6ef49c0f28",
+    "bank_trace": "bt_fddd40ce-6acc-4541-a92c-f6db2d547dc2",
+    "deposit_minor": 98,
+    "statement_identical_after_reads": true
+  },
+  "before_bank": {
+    "status": "pending",
+    "bank_amount": null,
+    "local_payout_status": "unbooked"
+  },
+  "fee_report": {
+    "operation_id": "ds_30965024b7ac1d6a9e9d4fe37f849d5b",
+    "payout_id": "po_0dc9f39f-23c3-4101-b4b0-2b748fd27b16",
+    "merchant_id": "mimi",
+    "currency": "USD",
+    "bank_trace": "bt_5a5b4109-0b49-4af8-b4ba-d64934a7c2be",
+    "net": 2940,
+    "bank_status": "matched",
+    "bank_amount": 2940,
+    "local_status": "unbooked",
+    "status": "variance",
+    "different_count": 2,
+    "missing_count": 0,
+    "expected_total": 60,
+    "actual_total": 60,
+    "variance": 0,
+    "lines": [
+      {
+        "payment_id": "dp_34f30483753e95ae5b969b4fd64fed8e",
+        "order_id": "FEE-A",
+        "reference": "ch_016c837e-06df-4411-a733-6a555e78ecca",
+        "line_id": "sl_df173db3-e2c5-45ba-a937-52e2e7992894",
+        "gross": 1000,
+        "expected": 20,
+        "actual": 25,
+        "variance": 5,
+        "rate_bps": 200,
+        "policy": "sim-card-fees-v1",
+        "recorded_at": "2026-11-19T22:19:25.369569+08:00"
+      },
+      {
+        "payment_id": "dp_163b4943dd337cd201f978448c6ed4d2",
+        "order_id": "FEE-B",
+        "reference": "ch_e3b8fe4c-1690-4da9-ae90-5f2d5c6f37aa",
+        "line_id": "sl_8d274919-75c2-405a-9244-26add379cb30",
+        "gross": 2000,
+        "expected": 40,
+        "actual": 35,
+        "variance": -5,
+        "rate_bps": 200,
+        "policy": "sim-card-fees-v1",
+        "recorded_at": "2026-11-19T22:19:25.371955+08:00"
+      }
+    ]
+  },
+  "browser_output": {
+    "unbooked_report_visible_after_blocked_import_without_reload": true,
+    "summary": {
+      "Settlement request": "ds_30965024b7ac1d6a9e9d4fe37f849d5b",
+      "Acquirer payout": "po_0dc9f39f-23c3-4101-b4b0-2b748fd27b16",
+      "Local payout status": "Awaiting import",
+      "Bank trace": "bt_5a5b4109-0b49-4af8-b4ba-d64934a7c2be",
+      "Statement net": "$29.40",
+      "Bank posting": "Matches the statement",
+      "Bank amount": "$29.40",
+      "Estimated fees": "$0.60",
+      "Statement fees": "$0.60",
+      "Net fee difference": "$0.00"
+    },
+    "itemized_amounts": {
+      "FEE-A": [
+        "$0.20",
+        "$0.25",
+        "+$0.05"
+      ],
+      "FEE-B": [
+        "$0.40",
+        "$0.35",
+        "-$0.05"
+      ]
+    },
+    "report_get_count": 2,
+    "financial_write_requests": 0,
+    "errors": []
+  },
+  "read_only_proof": {
+    "all_before_and_after_equal": true,
+    "per_table_before_and_after": {
+      "pay.pay.payments": {
+        "rows": 3,
+        "sha256": "7d79c3e1a8c1f0ba3a3752b7fb5fbc3d8d9e075d12a8a0967f0eba73030e8514"
+      },
+      "pay.pay.refunds": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "pay.pay.payouts": {
+        "rows": 1,
+        "sha256": "7c79f6ed1c904582d48b8244a5bce4c7b9523c2309bd22d9a1e9960ccc57e03e"
+      },
+      "pay.pay.lines": {
+        "rows": 2,
+        "sha256": "b017267bb0b5d997b2cc33baa47ab9e6e57db022b908f030a6410e1ddba8eba3"
+      },
+      "pay.pay.settlement_requests": {
+        "rows": 2,
+        "sha256": "2c88fb1e249917bf0bb3e1e44423dd7f77c252ec88004b040fa2bf1c5912fa64"
+      },
+      "pay.pay.settlement_expected": {
+        "rows": 6,
+        "sha256": "d4112a8e53e6a40abe5fb3857697b0da2bfb188bd3e8ec68ac01409348f3e94b"
+      },
+      "pay.pay.settlement_keys": {
+        "rows": 2,
+        "sha256": "4b7d160a401429354bfd4af279d0f2ffbd20bd8b25df731213d211afdb858b78"
+      },
+      "acquirer.sim_charge": {
+        "rows": 3,
+        "sha256": "86c83c233b8cc6f1085dddf221664f6d723cbea59044c012f7e60045bf43f4bf"
+      },
+      "acquirer.sim_refund": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "acquirer.sim_refund_decline": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "acquirer.sim_payout": {
+        "rows": 2,
+        "sha256": "f730dc205dff04b32fd1a8c449de1f15aa947a0dacef18400bab85e1da46f739"
+      },
+      "acquirer.sim_line": {
+        "rows": 6,
+        "sha256": "faa115cb96669d31958e8a861fefb55029dbab9c589eaff30b32248128dbdccd"
+      },
+      "acquirer.sim_fee_estimate": {
+        "rows": 3,
+        "sha256": "b93706be639260362514542c150bfe85ee00365b1d0115bc569ee826a5ed2724"
+      },
+      "bank.sim_bank_entry": {
+        "rows": 2,
+        "sha256": "a7045316f9555e472e992cec43432535958b06589bb8054ac77b242e44976d8b"
+      }
+    },
+    "hash_input": "UTF-8 rows of PostgreSQL to_jsonb(row)::text, sorted by text and joined with LF, with no final LF."
+  }
+}

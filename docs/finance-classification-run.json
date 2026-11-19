@@ -1,0 +1,338 @@
+{
+  "environment": "local simulated acquirer and bank; disposable Mimi store",
+  "verified_at": "2026-11-19T13:36:46.930848+00:00",
+  "currency": "USD",
+  "units": "cents",
+  "receipt": "68f280f3-0ace-4e8f-9bf8-5246add4becc",
+  "capture": {
+    "payment": "dp_d5f21195dcf9ad0aec6450221b0afc3a",
+    "reference": "ch_0e0ef834-4a27-4946-a69f-ac325fc0758c",
+    "amount": 360
+  },
+  "original_payout": "po_2648a781-f2bb-42df-8d31-6f3e4c980b08",
+  "original_bank_entry": {
+    "trace": "bt_9cd25c18-a24d-442e-8c55-e2c9be5055ac",
+    "merchant_id": "mimi",
+    "currency": "USD",
+    "amount": 353,
+    "status": "posted"
+  },
+  "source_refund": {
+    "operation_id": "sr_9682d6bcaac049de8e7ba8125a7e03b6",
+    "charge_reference": "ch_0e0ef834-4a27-4946-a69f-ac325fc0758c",
+    "amount": 120,
+    "merchant_id": "mimi",
+    "currency": "USD",
+    "reference": "rf_2466735d-4ea7-4e3e-b121-98b377262403",
+    "status": "succeeded",
+    "payment_id": "dp_d5f21195dcf9ad0aec6450221b0afc3a",
+    "origin": "acquirer",
+    "occurred_at": "2026-11-19T13:36:18.483854Z"
+  },
+  "finance_exception": {
+    "id": "dr_f796f21722b13ac94f90a68f0768aa39",
+    "sequence": 1,
+    "receipt": "68f280f3-0ace-4e8f-9bf8-5246add4becc",
+    "original_bank": "bt_9cd25c18-a24d-442e-8c55-e2c9be5055ac",
+    "original_deposit_minor": 353,
+    "states": [
+      "awaiting_bank",
+      "bank_matched"
+    ],
+    "count_after_replay": 1
+  },
+  "later_statement": {
+    "bank": "bt_7b3d70db-d53b-4f37-80ee-620df1393924",
+    "currency": "USD",
+    "depositMinor": -120,
+    "lines": [
+      {
+        "reference": "dr_f796f21722b13ac94f90a68f0768aa39",
+        "grossMinor": -120,
+        "feeMinor": 0,
+        "kind": "provider_refund",
+        "original": "dp_d5f21195dcf9ad0aec6450221b0afc3a"
+      }
+    ],
+    "payout": "po_e5de0e79-bf94-4918-9fa8-a3ab05bdc60b"
+  },
+  "later_bank_lookup_http_before_post": 404,
+  "later_bank_after_post": {
+    "trace": "bt_7b3d70db-d53b-4f37-80ee-620df1393924",
+    "merchant_id": "mimi",
+    "currency": "USD",
+    "amount": -120,
+    "status": "posted"
+  },
+  "original_settlement_journal": [
+    "bank|353",
+    "card_clearing|-360",
+    "processing_fees|7"
+  ],
+  "later_settlement_journal": [
+    "bank|-120",
+    "provider_refund_suspense|120"
+  ],
+  "original_record_sha256_before": "0f738cc7ba933e1f2f74872ffe3f0027d38191ef2c0bca9033d06559d01165bb",
+  "original_record_sha256_after": "0f738cc7ba933e1f2f74872ffe3f0027d38191ef2c0bca9033d06559d01165bb",
+  "premature_close_http": 409,
+  "self_approval_http": 403,
+  "service_restarts": 4,
+  "reporting_classification": {
+    "scope": "reporting-only; no financial journal entry or payment instruction",
+    "proposal": "ff87e519-c5f7-416a-8736-7a65fd532a8f",
+    "adjustment": "dr_f796f21722b13ac94f90a68f0768aa39",
+    "debit_batch": "88941c93-93d2-4d8f-9c45-99964d05ac8a",
+    "category": "merchant_funded_service_concession",
+    "reason": "Mimi agreed to a partial service concession following a documented delivery delay.",
+    "evidence_ref": "MIMI-SYNTHETIC-CASE-dr_f796f21722b13ac94f90a68f0768aa39",
+    "proposed_by": "6ae55ff5-f532-4dc2-9bb6-89540c402f97",
+    "proposed_at": "2026-11-19T21:36:41.426514+08:00",
+    "approved_by": "399b02a7-c488-4433-9490-159ddadbef5b",
+    "approved_at": "2026-11-19T21:36:43.933485+08:00",
+    "classification_states": [
+      "unclassified",
+      "pending_approval",
+      "approved"
+    ],
+    "premature_proposal_http": 409,
+    "self_approval_http": 403,
+    "wrong_proposal_http": 409,
+    "changed_proposal_terms_http": 409,
+    "concurrent_approval_submissions": 6,
+    "classification_proposals": 1,
+    "classification_approvals": 1,
+    "matched_debits": 1,
+    "successful_approval_audit_entries": 1,
+    "financial_fingerprints_before": {
+      "mimi": {
+        "basket_item": {
+          "rows": 1,
+          "sha256": "d5e9f35e1d945e2595e30be7c748591419ae4ae5cd9e7048b53e522ff767e4d1"
+        },
+        "card_attempt": {
+          "rows": 1,
+          "sha256": "88175cfc0561542fc9f0591fdb1ce15042534755778a6512b55d2861b25a9f0b"
+        },
+        "credit_entry": {
+          "rows": 1,
+          "sha256": "d219daa154e641ffa6c575bc850794b7266c8f480099148fffe0290a88bb9061"
+        },
+        "lot_balance": {
+          "rows": 12,
+          "sha256": "ea0b6021e28eb7246fd2a91bd77f1a5f88b8db7eb2c0e43dd2442af59e1405f9"
+        },
+        "provider_refund_applied": {
+          "rows": 1,
+          "sha256": "5be9673e24248715da3be623ac1f46814fb857f3bd06708d36ec00ca4482aaae"
+        },
+        "provider_refund_notice": {
+          "rows": 1,
+          "sha256": "48baa49722bd716ac9a9293a6dd96f1165d6f0924b770c4cb6ac7231ac5c7735"
+        },
+        "register_receipt": {
+          "rows": 1,
+          "sha256": "39498232e6c2ade5cedfbf179c6c3a1d79d39e5b75b57d2762032a60c4045659"
+        },
+        "register_refund": {
+          "rows": 0,
+          "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "sale_basket": {
+          "rows": 1,
+          "sha256": "bbbe277d0a8d546af6773a46d1134e67e7a2b8979f61d8432805fdc610bc7ec9"
+        },
+        "settlement_batch": {
+          "rows": 2,
+          "sha256": "187c053cee239cc6cef18e512a9a847a1984f1a8e0fc327ab8053a936ff33611"
+        },
+        "settlement_journal": {
+          "rows": 5,
+          "sha256": "f5e77a1f6c12aba58e37d6db2874bd51b2ca3a766fc1a9c605d0f28f0bb29a5a"
+        },
+        "settlement_line": {
+          "rows": 2,
+          "sha256": "9ff791295ded014885a41343fb3cbaabfefe57b1e536c1d426b84c9b7b6e5edb"
+        },
+        "stock": {
+          "rows": 18,
+          "sha256": "d63a786957e0ca94fec86967e529c9a59d83c19a7e70386f92353a01c25e1912"
+        },
+        "stock_move": {
+          "rows": 13,
+          "sha256": "86ea99446175f96ed292e2e5c3d59442fcb39b09262d751b94ccfa647b3730e1"
+        },
+        "tender_journal": {
+          "rows": 10,
+          "sha256": "22683701c152cfd71dcd4e44cec330523b8ed54912e7703b3c1d227eb9ed2915"
+        }
+      },
+      "dakim_pay": {
+        "pay.lines": {
+          "rows": 3,
+          "sha256": "88661d91498f7924bf91e656aeedb439e1858a8d279d6ffb8c9eeedd02393cb7"
+        },
+        "pay.payments": {
+          "rows": 1,
+          "sha256": "053d2eb28e5ca99baf07e573444ce3905da898b65846a3976f3db6d1823c8988"
+        },
+        "pay.payouts": {
+          "rows": 2,
+          "sha256": "042f88004936b19edea564d8f71fa5526df1cf4fab4388d4fcf492f0c804b67b"
+        },
+        "pay.refunds": {
+          "rows": 1,
+          "sha256": "84360e4b188490a5b8dc64ccf78eaf9ce65d053024199e0500221e13e1aa4fcf"
+        },
+        "pay.settlement_requests": {
+          "rows": 2,
+          "sha256": "e8f72ce46a5ee44761b430483bf982557bc8fedf66bcadd957088580dbdc78da"
+        }
+      },
+      "acquirer": {
+        "sim_charge": {
+          "rows": 1,
+          "sha256": "d1caef979bfd4ae9b42f784a2b86a41603fe95403fa78216f3a5799070aa9b08"
+        },
+        "sim_line": {
+          "rows": 3,
+          "sha256": "ef1f90e5fa11759ee607bad5a9e6d96db617b73e3dc6a2545c6a0215705197a5"
+        },
+        "sim_payout": {
+          "rows": 2,
+          "sha256": "04898109ff2088ee02628496031b771a5f24565476f649fbf17a8b46bbae8bc9"
+        },
+        "sim_refund": {
+          "rows": 1,
+          "sha256": "cfa8ed4ae01dff49100ae2a448e9172b5e6891454521558f2d7f25f285ddbde5"
+        },
+        "sim_refund_decline": {
+          "rows": 0,
+          "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        }
+      },
+      "bank": {
+        "sim_bank_entry": {
+          "rows": 2,
+          "sha256": "e2b60715184cb51e0422954d7f6f177878730bf1dc99c3b2307742e8a40e1ebc"
+        }
+      }
+    },
+    "financial_fingerprints_after": {
+      "mimi": {
+        "basket_item": {
+          "rows": 1,
+          "sha256": "d5e9f35e1d945e2595e30be7c748591419ae4ae5cd9e7048b53e522ff767e4d1"
+        },
+        "card_attempt": {
+          "rows": 1,
+          "sha256": "88175cfc0561542fc9f0591fdb1ce15042534755778a6512b55d2861b25a9f0b"
+        },
+        "credit_entry": {
+          "rows": 1,
+          "sha256": "d219daa154e641ffa6c575bc850794b7266c8f480099148fffe0290a88bb9061"
+        },
+        "lot_balance": {
+          "rows": 12,
+          "sha256": "ea0b6021e28eb7246fd2a91bd77f1a5f88b8db7eb2c0e43dd2442af59e1405f9"
+        },
+        "provider_refund_applied": {
+          "rows": 1,
+          "sha256": "5be9673e24248715da3be623ac1f46814fb857f3bd06708d36ec00ca4482aaae"
+        },
+        "provider_refund_notice": {
+          "rows": 1,
+          "sha256": "48baa49722bd716ac9a9293a6dd96f1165d6f0924b770c4cb6ac7231ac5c7735"
+        },
+        "register_receipt": {
+          "rows": 1,
+          "sha256": "39498232e6c2ade5cedfbf179c6c3a1d79d39e5b75b57d2762032a60c4045659"
+        },
+        "register_refund": {
+          "rows": 0,
+          "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "sale_basket": {
+          "rows": 1,
+          "sha256": "bbbe277d0a8d546af6773a46d1134e67e7a2b8979f61d8432805fdc610bc7ec9"
+        },
+        "settlement_batch": {
+          "rows": 2,
+          "sha256": "187c053cee239cc6cef18e512a9a847a1984f1a8e0fc327ab8053a936ff33611"
+        },
+        "settlement_journal": {
+          "rows": 5,
+          "sha256": "f5e77a1f6c12aba58e37d6db2874bd51b2ca3a766fc1a9c605d0f28f0bb29a5a"
+        },
+        "settlement_line": {
+          "rows": 2,
+          "sha256": "9ff791295ded014885a41343fb3cbaabfefe57b1e536c1d426b84c9b7b6e5edb"
+        },
+        "stock": {
+          "rows": 18,
+          "sha256": "d63a786957e0ca94fec86967e529c9a59d83c19a7e70386f92353a01c25e1912"
+        },
+        "stock_move": {
+          "rows": 13,
+          "sha256": "86ea99446175f96ed292e2e5c3d59442fcb39b09262d751b94ccfa647b3730e1"
+        },
+        "tender_journal": {
+          "rows": 10,
+          "sha256": "22683701c152cfd71dcd4e44cec330523b8ed54912e7703b3c1d227eb9ed2915"
+        }
+      },
+      "dakim_pay": {
+        "pay.lines": {
+          "rows": 3,
+          "sha256": "88661d91498f7924bf91e656aeedb439e1858a8d279d6ffb8c9eeedd02393cb7"
+        },
+        "pay.payments": {
+          "rows": 1,
+          "sha256": "053d2eb28e5ca99baf07e573444ce3905da898b65846a3976f3db6d1823c8988"
+        },
+        "pay.payouts": {
+          "rows": 2,
+          "sha256": "042f88004936b19edea564d8f71fa5526df1cf4fab4388d4fcf492f0c804b67b"
+        },
+        "pay.refunds": {
+          "rows": 1,
+          "sha256": "84360e4b188490a5b8dc64ccf78eaf9ce65d053024199e0500221e13e1aa4fcf"
+        },
+        "pay.settlement_requests": {
+          "rows": 2,
+          "sha256": "e8f72ce46a5ee44761b430483bf982557bc8fedf66bcadd957088580dbdc78da"
+        }
+      },
+      "acquirer": {
+        "sim_charge": {
+          "rows": 1,
+          "sha256": "d1caef979bfd4ae9b42f784a2b86a41603fe95403fa78216f3a5799070aa9b08"
+        },
+        "sim_line": {
+          "rows": 3,
+          "sha256": "ef1f90e5fa11759ee607bad5a9e6d96db617b73e3dc6a2545c6a0215705197a5"
+        },
+        "sim_payout": {
+          "rows": 2,
+          "sha256": "04898109ff2088ee02628496031b771a5f24565476f649fbf17a8b46bbae8bc9"
+        },
+        "sim_refund": {
+          "rows": 1,
+          "sha256": "cfa8ed4ae01dff49100ae2a448e9172b5e6891454521558f2d7f25f285ddbde5"
+        },
+        "sim_refund_decline": {
+          "rows": 0,
+          "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        }
+      },
+      "bank": {
+        "sim_bank_entry": {
+          "rows": 2,
+          "sha256": "e2b60715184cb51e0422954d7f6f177878730bf1dc99c3b2307742e8a40e1ebc"
+        }
+      }
+    },
+    "service_restarts_during_classification": 2
+  },
+  "concurrent_source_submissions": 4
+}

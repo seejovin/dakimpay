@@ -56,6 +56,8 @@ func run(ctx context.Context, role string) error {
 		h, err = simulator.BankWithKeys(ctx, pool, env("SERVICE_TOKEN"), env("INSTRUCTION_TOKEN"), env("POST_TOKEN"))
 	case "acquirer":
 		h, err = simulator.AcquirerWithKeys(ctx, pool, public, origin("BANK_URL"), env("SERVICE_TOKEN"), env("INSTRUCTION_TOKEN"), env("APPROVE_TOKEN"))
+		destination, signingKey := origin("PAY_URL")+"/callbacks/processor", env("CALLBACK_KEY")
+		worker = func(ctx context.Context) { simulator.RunCallbacks(ctx, pool, destination, signingKey) }
 	case "pay":
 		bank, acq := origin("BANK_URL"), origin("ACQUIRER_URL")
 		service, e := pay.New(ctx, pool, acq, bank, env("SERVICE_TOKEN"))
@@ -67,7 +69,10 @@ func run(ctx context.Context, role string) error {
 			return e
 		}
 		worker = service.RunRecovery
-		h = console.New(public, acq, bank, env("MERCHANT_TOKEN"), env("SESSION_SECRET"), env("APPROVE_TOKEN"), env("POST_TOKEN"), service.Handler(), web)
+		mux := http.NewServeMux()
+		mux.Handle("POST /callbacks/processor", service.CallbackHandler(env("CALLBACK_KEY")))
+		mux.Handle("/", console.New(public, acq, bank, env("MERCHANT_TOKEN"), env("SESSION_SECRET"), env("APPROVE_TOKEN"), env("POST_TOKEN"), service.Handler(), web))
+		h = mux
 	default:
 		return errors.New("usage: dakimpay pay|acquirer|bank")
 	}

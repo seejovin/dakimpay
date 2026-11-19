@@ -99,8 +99,8 @@ def start():
     tmp=state/"dakimpay.next"
     run("go","build","-trimpath","-o",tmp,".",cwd=repo)
     tmp.replace(binary)
-    keys={k:secret(k) for k in ("service_token","instruction_token","post_token","approve_token","merchant_token","session_secret")}
-    cfg={"bank":["service_token","instruction_token","post_token"],"acquirer":["service_token","instruction_token","approve_token"],"pay":["service_token","merchant_token","session_secret","post_token","approve_token"]}
+    keys={k:secret(k) for k in ("service_token","instruction_token","post_token","approve_token","merchant_token","session_secret","callback_key")}
+    cfg={"bank":["service_token","instruction_token","post_token"],"acquirer":["service_token","instruction_token","approve_token","callback_key"],"pay":["service_token","merchant_token","session_secret","post_token","approve_token","callback_key"]}
     for role in roles:
         if owned_pid(role):
             if not health(role):sys.exit(f"{role} process exists but is unhealthy.")
@@ -109,7 +109,7 @@ def start():
         name="dakim_"+role
         db=f"host='{socket}' port={pgport} user={name} dbname={name} sslmode=disable"
         env={k:v for k,v in os.environ.items() if not k.startswith(("DAKIM_","PG"))}
-        env.update(DAKIM_ORIGIN=url(role),DAKIM_DB=db,DAKIM_BANK_URL=url("bank"),DAKIM_ACQUIRER_URL=url("acquirer"))
+        env.update(DAKIM_ORIGIN=url(role),DAKIM_DB=db,DAKIM_BANK_URL=url("bank"),DAKIM_ACQUIRER_URL=url("acquirer"),DAKIM_PAY_URL=url("pay"))
         env.update({"DAKIM_"+k.upper():keys[k] for k in cfg[role]})
         with (state/(role+".log")).open("ab") as log:
             proc=subprocess.Popen([binary,role],env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True)

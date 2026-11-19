@@ -1,0 +1,64 @@
+{
+  "environment": "disposable Mimi training store",
+  "from_migration": 130,
+  "to_migration": 135,
+  "verified": "row counts and SHA-256 identical before and after applying migration",
+  "tables_and_views": {
+    "drawer_entry": {
+      "rows": 1,
+      "sha256_before_and_after": "86012aa43cbd23bf6768d6d6d002f59418d208c1ad5afbd59db60e8fa1cfc283"
+    },
+    "external_card_reversal_leg": {
+      "rows": 3,
+      "sha256_before_and_after": "31d07f7ed33c86ec0671984d7cbb97163c6aaf423235dc69b2336b0f7e6a5991"
+    },
+    "external_reversal_applied": {
+      "rows": 3,
+      "sha256_before_and_after": "69a917f90cd18da8ccc07499f342f0325a822e11a6e24458feee6e51f01313cf"
+    },
+    "financial_date": {
+      "rows": 14,
+      "sha256_before_and_after": "aeec0ae89b57122d5cd8b0effb32d1b9414228cde397936cc539d49b6ce6e6ff"
+    },
+    "register_receipt": {
+      "rows": 3,
+      "sha256_before_and_after": "7c65b49e68837fa3c286f206b5615f7d048765df00298aedb1ab46d07a19b59d"
+    },
+    "register_refund": {
+      "rows": 1,
+      "sha256_before_and_after": "ffa18dd84d900cf2459e09b7c468f18bf6781ed7bce3069c7530102e56c2dd2f"
+    },
+    "settlement_applied": {
+      "rows": 3,
+      "sha256_before_and_after": "18393942a953e2307fe04da083af2b01ab7dad847626573849b6d7e1b4f38e86"
+    },
+    "settlement_batch": {
+      "rows": 3,
+      "sha256_before_and_after": "d014be4fdde3becdf54a48a8f5c5d5c553fd3562c93cd32adeea8bf329ac7c83"
+    },
+    "settlement_evidence": {
+      "rows": 9,
+      "sha256_before_and_after": "17635e82200e440544b392fdefa17b908e3ccde8e7815364d80a379eba8591ca"
+    },
+    "settlement_journal": {
+      "rows": 8,
+      "sha256_before_and_after": "0a88caf7f4a3e1d4feeaf8073f05f0125d88d3efae8ce93a21fab6d6fac79d4f"
+    },
+    "settlement_line": {
+      "rows": 6,
+      "sha256_before_and_after": "6006b281c3ae8e29badeb024642215089c6f8062c6d9002529227b55e9bcafbc"
+    },
+    "shift": {
+      "rows": 1,
+      "sha256_before_and_after": "f63b63d1c508bbed69670786b9da6817430aa3956aff005ed88e503209e9beea"
+    },
+    "stock_move": {
+      "rows": 17,
+      "sha256_before_and_after": "fe0b57645a13ef8862f08ce38dedb50d1bd7348572706348926fc0215d202ebe"
+    },
+    "tender_journal": {
+      "rows": 22,
+      "sha256_before_and_after": "54e5402ebbc07ea00d2137dba2fe863a1ba1fe4d086f919a3deb7bbacf06cc94"
+    }
+  }
+}

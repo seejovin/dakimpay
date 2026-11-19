@@ -1,0 +1,24 @@
+{
+  "old_migration": 145,
+  "new_migration": 150,
+  "cases": [
+    {
+      "previous_state": "pending",
+      "observed_after_upgrade": "pending_approval",
+      "historical_records_compared": 19,
+      "sha256_before": "ec4243a3575003e9b84c554e5cac5e45883d31abd407ec515b5971f218fefe7b",
+      "sha256_after": "ec4243a3575003e9b84c554e5cac5e45883d31abd407ec515b5971f218fefe7b",
+      "approved_decisions": 0,
+      "version": 1
+    },
+    {
+      "previous_state": "approved",
+      "observed_after_upgrade": "approved",
+      "historical_records_compared": 19,
+      "sha256_before": "e76cbe8a6100a56cbcbc6d16ae5d94f61c5e7f4863155d52e5a7d5ad7c0868c2",
+      "sha256_after": "e76cbe8a6100a56cbcbc6d16ae5d94f61c5e7f4863155d52e5a7d5ad7c0868c2",
+      "approved_decisions": 1,
+      "version": 1
+    }
+  ]
+}

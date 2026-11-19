@@ -24,53 +24,49 @@ type refund struct {
 	Status    string `json:"status"`
 }
 
+func readRefund(row pgx.Row) (refund, error) {
+	r := refund{Status: "succeeded"}
+	err := row.Scan(&r.Operation, &r.Charge, &r.Amount, &r.Merchant, &r.Currency, &r.Reference)
+	return r, err
+}
+
+const declineFields = "SELECT operation_id,charge_reference,amount,merchant_id,currency,origin FROM sim_refund_decline WHERE operation_id=$1 AND merchant_id='mimi'"
+
+func readDecline(row pgx.Row) (SourceRefund, error) {
+	var f SourceRefund
+	f.Status = "declined"
+	err := row.Scan(&f.Operation, &f.Charge, &f.Amount, &f.Merchant, &f.Currency, &f.Origin)
+	return f, err
+}
+
+func (a *acquirer) getRefund(w http.ResponseWriter, r *http.Request) {
+	operation := r.PathValue("operation")
+	result, err := readRefund(a.pool.QueryRow(r.Context(), `SELECT operation_id,charge_reference,amount,merchant_id,currency,reference
+ FROM sim_refund WHERE operation_id=$1 AND merchant_id='mimi' AND origin='merchant'`, operation))
+	if errors.Is(err, pgx.ErrNoRows) {
+		var declined SourceRefund
+		declined, err = readDecline(a.pool.QueryRow(r.Context(), declineFields+" AND origin='merchant'", operation))
+		result = declined.refund
+	}
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	jsonResponse(w, http.StatusOK, result)
+}
+
 func (a *acquirer) createRefund(w http.ResponseWriter, r *http.Request) {
 	var req refundRequest
 	if err := readJSON(r, &req); err != nil {
 		respondError(w, err)
 		return
 	}
-	if req.Merchant != merchant || req.Currency != currency || !validID(req.Operation) || !validID(req.Charge) || req.Amount <= 0 || req.Amount > limit {
-		respondError(w, invalid("Invalid original payment or refund fields"))
-		return
-	}
-	ctx := r.Context()
-	result := refund{refundRequest: req, Status: "succeeded"}
-	err := write(ctx, a.pool, func(tx pgx.Tx) error {
-		var prior refundRequest
-		err := tx.QueryRow(ctx, "select operation_id,charge_reference,amount,merchant_id,currency,reference from sim_refund where operation_id=$1", req.Operation).Scan(&prior.Operation, &prior.Charge, &prior.Amount, &prior.Merchant, &prior.Currency, &result.Reference)
-		if err == nil {
-			if prior != req {
-				return conflict("Refund operation already bound to another request")
-			}
-			return nil
-		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return err
-		}
-		var status, order string
-		var available int64
-		err = tx.QueryRow(ctx, `select status,order_id,amount-(select coalesce(sum(amount),0) from sim_refund where charge_reference=c.reference)
-			from sim_charge c where reference=$1 and merchant_id=$2 and currency=$3`, req.Charge, req.Merchant, req.Currency).Scan(&status, &order, &available)
-		if err != nil {
-			return err
-		}
-		if status != "captured" || req.Amount > available {
-			return conflict("Refund exceeds remaining captured amount")
-		}
-		err = tx.QueryRow(ctx, `insert into sim_refund(operation_id,charge_reference,amount,merchant_id,currency) values($1,$2,$3,$4,$5) returning reference`,
-			req.Operation, req.Charge, req.Amount, req.Merchant, req.Currency).Scan(&result.Reference)
-		if err != nil {
-			return err
-		}
-		_, err = tx.Exec(ctx, "insert into sim_line(kind,reference,amount,batch) values('refund',$1,$2,$3)", result.Reference, -req.Amount, batchFor(order))
-		return err
-	})
+	result, err := recordRefund(r.Context(), a.pool, req, "merchant")
 	if err != nil {
 		respondError(w, err)
 		return
 	}
-	jsonResponse(w, 200, result)
+	jsonResponse(w, 200, result.refund)
 }
 
 type payoutRequest struct {
@@ -92,6 +88,14 @@ type payout struct {
 	Currency string `json:"currency"`
 	Net      int64  `json:"net"`
 	Lines    []line `json:"lines"`
+}
+
+func payoutLines(ctx context.Context, tx pgx.Tx, id string) ([]line, error) {
+	rows, err := tx.Query(ctx, "SELECT id,kind,reference,amount FROM sim_line WHERE payout_id=$1 ORDER BY sequence", id)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[line])
 }
 
 func (a *acquirer) settle(w http.ResponseWriter, r *http.Request) {
@@ -138,15 +142,7 @@ func (a *acquirer) settle(w http.ResponseWriter, r *http.Request) {
 		default:
 			return err
 		}
-		rows, err := tx.Query(ctx, "select id,kind,reference,amount from sim_line where payout_id=$1 order by sequence", p.ID)
-		if err != nil {
-			return err
-		}
-		p.Lines, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (line, error) {
-			var l line
-			err := row.Scan(&l.ID, &l.Kind, &l.Reference, &l.Amount)
-			return l, err
-		})
+		p.Lines, err = payoutLines(ctx, tx, p.ID)
 		return err
 	})
 	if err != nil {

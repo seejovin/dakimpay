@@ -1,3 +1,27 @@
+diff --git a/internal/retail/card_queue.go b/internal/retail/card_queue.go
+index 6b803f4..b3743af 100644
+--- a/internal/retail/card_queue.go
++++ b/internal/retail/card_queue.go
+@@ -16,6 +16,19 @@ func QueueCardRefund(ctx context.Context, tx pgx.Tx, a Actor, refundID, receiptI
+ 	if disputed {
+ 		return Fail(409, "A chargeback is recorded for the original payment. Reconcile the dispute with the processor before issuing a card refund.")
+ 	}
++	var exceedsRefundable bool
++	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT FROM card_attempt c WHERE c.receipt_id=$1 AND c.kind='charge' AND c.status='succeeded'
++	AND EXISTS(SELECT FROM provider_refund_notice n WHERE (n.provider,n.merchant,n.payment_ref,n.currency)=(c.provider,c.merchant,c.remote_id,c.currency))
++	AND $2::bigint > c.amount_minor
++	- (SELECT coalesce(sum(n.amount_minor),0) FROM provider_refund_notice n WHERE (n.provider,n.merchant,n.payment_ref,n.currency)=(c.provider,c.merchant,c.remote_id,c.currency))
++	- (SELECT coalesce(sum(r.amount_minor),0) FROM card_attempt r WHERE (r.provider,r.merchant,r.original_ref)=(c.provider,c.merchant,c.remote_id)
++	AND r.kind='refund' AND r.status IN ('queued','processing','unknown','succeeded')))`, receiptID, amount).Scan(&exceedsRefundable)
++	if err != nil {
++		return err
++	}
++	if exceedsRefundable {
++		return Fail(409, "A provider refund reduced the remaining original-card balance. Review the receipt with finance.")
++	}
+ 	cmd, err := tx.Exec(ctx, `insert into retail.card_attempt(kind,basket_id,receipt_id,refund_id,original_ref,actor,role,lane,provider,merchant,reader,currency,minor_digits,amount_minor)
+  select 'refund',basket_id,receipt_id,$1,remote_id,$3,$4,$5,provider,merchant,reader,currency,minor_digits,$6 from retail.card_attempt where receipt_id=$2 and kind='charge' and status='succeeded'`, refundID, receiptID, a.ID, a.Role, a.Lane, amount)
+ 	if err == nil && cmd.RowsAffected() != 1 {
 diff --git a/internal/server/card_evidence.go b/internal/server/card_evidence.go
 index 3976066..8f724e0 100644
 --- a/internal/server/card_evidence.go
@@ -17,7 +41,7 @@ index 3976066..8f724e0 100644
  		return nil, retail.Fail(422, "Reference format does not match this payment operation.")
  	}
 diff --git a/internal/server/cards.go b/internal/server/cards.go
-index 38b89fb..88053ea 100644
+index 38b89fb..007f219 100644
 --- a/internal/server/cards.go
 +++ b/internal/server/cards.go
 @@ -47,6 +47,9 @@ func CardConfig(db *pgxpool.Pool, st Store) (*CardService, error) {
@@ -39,12 +63,40 @@ index 38b89fb..88053ea 100644
  }
  func (c *CardService) lease(ctx context.Context) (j CardJob, err error) {
  	err = pgx.BeginFunc(ctx, c.DB, func(tx pgx.Tx) error {
+@@ -331,7 +334,14 @@ func (c *CardService) Step(ctx context.Context) (bool, error) {
+ 	if e != nil {
+ 		fact.State = "unknown"
+ 		wait = 8 * time.Second
+-		if errors.Is(e, errReversedReference) && fact.Remote != "" && fact.Remote == j.Remote {
++		// A supplier may confirm the original operation ID on create while its
++		// separate capture/refund inspection is unavailable. Retain that binding
++		// and inspect it on restart, including after the create replay window.
++		originalKnown := fact.Remote != "" && (fact.Remote == j.Remote || (j.Stage == "create" && j.Remote == ""))
++		if originalKnown && j.Stage == "create" {
++			stage = "inspect"
++		}
++		if errors.Is(e, errReversedReference) && originalKnown {
+ 			stage = "reversal_review"
+ 			message = "The original capture has a refund or dispute. Hold the goods and reconcile with finance before taking another payment."
+ 		}
+@@ -408,6 +418,11 @@ func (c *CardService) Run(ctx context.Context) {
+ 	if c.Adapter == nil {
+ 		return
+ 	}
++	if source, ok := c.Adapter.(adjustmentReader); ok {
++		done := make(chan struct{})
++		go func() { defer close(done); c.monitorProviderRefunds(ctx, source) }()
++		defer func() { <-done }()
++	}
+ 	timer := time.NewTimer(time.Millisecond)
+ 	defer timer.Stop()
+ 	for {
 diff --git a/internal/server/dakim_terminal.go b/internal/server/dakim_terminal.go
 new file mode 100644
-index 0000000..6c41568
+index 0000000..984a48c
 --- /dev/null
 +++ b/internal/server/dakim_terminal.go
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,289 @@
 +package server
 +
 +import (
@@ -57,6 +109,7 @@ index 0000000..6c41568
 +	"net/http"
 +	"net/url"
 +	"os"
++	"regexp"
 +	"strings"
 +	"time"
 +)
@@ -75,7 +128,7 @@ index 0000000..6c41568
 +	Original                                        string `json:"payment_id"`
 +	Operation                                       string `json:"merchant_operation"`
 +	Amount                                          int64
-+	Refunded                                        int64
++	Refunded                                        *int64
 +}
 +
 +func configureDakim(c *CardService, store Store) (*CardService, error) {
@@ -113,19 +166,23 @@ index 0000000..6c41568
 +	c.Adapter = &DakimSimulator{base: base, token: token, brand: brand, client: &http.Client{Timeout: 8 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 +	return c, nil
 +}
-+func (d *DakimSimulator) request(ctx context.Context, j CardJob, method, path, key string, body any) (CardFact, error) {
++func (d *DakimSimulator) exchange(ctx context.Context, j CardJob, method, path, key string, body, out any) error {
 +	if j.Merchant != "mimi" || j.Provider != "dakim-simulator" || j.Currency != "USD" || j.Digits != 2 || j.Amount <= 0 || j.Reader != "MIMI-01" {
-+		return CardFact{}, errors.New("invalid dakim merchant binding")
++		return errors.New("invalid dakim merchant binding")
 +	}
++	return d.call(ctx, method, path, key, body, out)
++}
++
++func (d *DakimSimulator) call(ctx context.Context, method, path, key string, body, out any) error {
 +	var input bytes.Buffer
 +	if body != nil {
 +		if err := json.NewEncoder(&input).Encode(body); err != nil {
-+			return CardFact{}, err
++			return err
 +		}
 +	}
 +	req, err := http.NewRequestWithContext(ctx, method, d.base+path, &input)
 +	if err != nil {
-+		return CardFact{}, err
++		return err
 +	}
 +	req.Header.Set("Authorization", "Bearer "+d.token)
 +	if method == "POST" {
@@ -136,21 +193,42 @@ index 0000000..6c41568
 +	}
 +	resp, err := d.client.Do(req)
 +	if err != nil {
-+		return CardFact{}, errors.New("dakim pay unavailable")
++		return errors.New("dakim pay unavailable")
 +	}
 +	defer resp.Body.Close()
 +	if resp.StatusCode/100 != 2 {
-+		return CardFact{}, fmt.Errorf("dakim pay returned HTTP %d", resp.StatusCode)
++		return fmt.Errorf("dakim pay returned HTTP %d", resp.StatusCode)
 +	}
-+	var f dakimEvidence
-+	if err = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&f); err != nil {
++	const limit = 1 << 20
++	raw, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
++	if err != nil {
++		return err
++	}
++	if len(raw) > limit {
++		return errors.New("dakim pay evidence exceeds the maximum response size")
++	}
++	if !uniqueJSON(raw) {
++		return errors.New("malformed or ambiguous dakim pay evidence")
++	}
++	return json.Unmarshal(raw, out)
++}
++func (d *DakimSimulator) request(ctx context.Context, j CardJob, method, path, key string, body any) (CardFact, error) {
++	var reply struct {
++		dakimEvidence
++		WireReference *string `json:"reference"`
++	}
++	if err := d.exchange(ctx, j, method, path, key, body, &reply); err != nil {
 +		return CardFact{}, err
++	}
++	f := reply.dakimEvidence
++	if reply.WireReference != nil {
++		f.Reference = *reply.WireReference
 +	}
 +	prefix := "dp_"
 +	if j.Kind == "refund" {
 +		prefix = "dr_"
 +	}
-+	if !safeRemoteID.MatchString(f.ID) || !strings.HasPrefix(f.ID, prefix) || f.Merchant != j.Merchant || f.Amount != j.Amount || f.Currency != j.Currency || (j.Remote != "" && f.ID != j.Remote) {
++	if !dakimOperationID(f.ID, prefix) || f.Merchant != j.Merchant || f.Amount != j.Amount || f.Currency != j.Currency || (j.Remote != "" && f.ID != j.Remote) {
 +		return CardFact{}, errors.New("dakim pay evidence does not match the original operation")
 +	}
 +	result := CardFact{Remote: f.ID, State: "unknown"}
@@ -158,25 +236,47 @@ index 0000000..6c41568
 +		if f.Order != "MIMI-"+j.ID || f.Channel != "terminal" || f.Terminal != j.Reader {
 +			return CardFact{}, errors.New("dakim pay order or terminal mismatch")
 +		}
-+		if f.Refunded > 0 {
++		// Only explicit, valid cumulative refund evidence can establish a spendable capture.
++		// A missing field in a partial or changed provider response must leave the till on hold.
++		if f.Refunded == nil || *f.Refunded < 0 || *f.Refunded > j.Amount {
++			return CardFact{}, errors.New("dakim pay refund total is missing or outside the captured amount")
++		}
++		if *f.Refunded > 0 {
 +			return result, errReversedReference
 +		}
-+		if f.Status == "captured" && f.Reference != "" {
++		if f.Status == "captured" && strings.TrimSpace(f.Reference) != "" {
++			j.Remote = f.ID
++			evidence, err := d.reversalEvidence(ctx, j)
++			if err != nil {
++				return result, err
++			}
++			if evidence.Payment.Reference != f.Reference || evidence.Payment.Brand != f.Brand {
++				return result, errors.New("dakim pay changed the original capture evidence")
++			}
++			if evidence.Dispute == "open" || len(evidence.Refunds) != 0 {
++				return result, errReversedReference
++			}
++			if evidence.Dispute != "none" {
++				return result, errUnprovenReversal
++			}
 +			result.State = "succeeded"
 +		}
 +	} else {
 +		if f.Original != j.Original || f.Operation != j.ID {
 +			return CardFact{}, errors.New("dakim pay refund parent or operation mismatch")
 +		}
-+		if f.Status == "succeeded" && f.Reference != "" {
++		if f.Status == "succeeded" && strings.TrimSpace(f.Reference) != "" {
 +			result.State = "succeeded"
++		} else if f.Status == "declined" && reply.WireReference != nil && f.Reference == "" {
++			// The provider records a definitive refusal against this exact request.
++			result.State = "declined"
 +		}
 +	}
 +	return result, nil
 +}
 +func (d *DakimSimulator) Create(ctx context.Context, j CardJob) (CardFact, error) {
 +	if j.Kind == "refund" {
-+		if !safeRemoteID.MatchString(j.Original) {
++		if !dakimOperationID(j.Original, "dp_") {
 +			return CardFact{}, errors.New("invalid original payment")
 +		}
 +		return d.request(ctx, j, "POST", "/v1/payments/"+j.Original+"/refunds", j.ID, map[string]any{"amount": j.Amount})
@@ -213,6 +313,151 @@ index 0000000..6c41568
 +func (d *DakimSimulator) Cancel(ctx context.Context, j CardJob) (CardFact, error) {
 +	return d.Inspect(ctx, j)
 +}
++
++func dakimOperationID(value, prefix string) bool {
++	return len(value) > len(prefix) && len(value) <= 128 && strings.HasPrefix(value, prefix) && safeRemoteID.MatchString(value)
++}
++
++var dakimSourceID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
++
++type dakimRefundLeg struct {
++	dakimEvidence
++	Charge string `json:"charge_reference"`
++}
++
++type dakimReversal struct {
++	Payment  dakimEvidence
++	Refunds  []dakimRefundLeg
++	Complete bool
++	Dispute  string `json:"dispute_status"`
++}
++
++// Read a single merchant snapshot verified against the acquirer, including refund
++// reservations that would not appear in the captured payment's cumulative total.
++func (d *DakimSimulator) reversalEvidence(ctx context.Context, j CardJob) (dakimReversal, error) {
++	var v dakimReversal
++	if j.Kind != "charge" || !dakimOperationID(j.Remote, "dp_") {
++		return v, errUnprovenReversal
++	}
++	if err := d.exchange(ctx, j, "GET", "/v1/payments/"+j.Remote+"/reversal-evidence", "", nil, &v); err != nil {
++		return dakimReversal{}, err
++	}
++	p := v.Payment
++	if !v.Complete || v.Refunds == nil || (v.Dispute != "none" && v.Dispute != "open" && v.Dispute != "unknown") ||
++		p.ID != j.Remote || p.Merchant != j.Merchant || p.Order != "MIMI-"+j.ID || p.Channel != "terminal" || p.Terminal != j.Reader ||
++		(p.Brand != "visa" && p.Brand != "mastercard" && p.Brand != "amex") || p.Status != "captured" ||
++		!dakimSourceID.MatchString(p.Reference) || p.Amount != j.Amount || p.Currency != j.Currency || p.Refunded == nil {
++		return dakimReversal{}, errUnprovenReversal
++	}
++	seenRefund := make(map[string]bool, len(v.Refunds))
++	seenReference := map[string]bool{p.Reference: true}
++	seenOperation := make(map[string]bool, len(v.Refunds))
++	var total int64
++	for _, r := range v.Refunds {
++		if !dakimOperationID(r.ID, "dr_") || seenRefund[r.ID] ||
++			!dakimSourceID.MatchString(r.Reference) || seenReference[r.Reference] || !dakimSourceID.MatchString(r.Operation) || seenOperation[r.Operation] ||
++			r.Status != "succeeded" || r.Merchant != p.Merchant || r.Original != p.ID || r.Charge != p.Reference ||
++			r.Currency != p.Currency || r.Amount <= 0 || r.Amount > p.Amount-total {
++			return dakimReversal{}, errUnprovenReversal
++		}
++		seenRefund[r.ID] = true
++		seenReference[r.Reference] = true
++		seenOperation[r.Operation] = true
++		total += r.Amount
++	}
++	if *p.Refunded != total {
++		return dakimReversal{}, errUnprovenReversal
++	}
++	return v, nil
++}
++
++func (d *DakimSimulator) FullReversal(ctx context.Context, j CardJob) (reversalProof, error) {
++	v, err := d.reversalEvidence(ctx, j)
++	if err != nil {
++		return reversalProof{}, err
++	}
++	if v.Dispute != "none" || *v.Payment.Refunded != j.Amount {
++		return reversalProof{}, errUnprovenReversal
++	}
++	proof := reversalProof{Charge: v.Payment.Reference}
++	for _, r := range v.Refunds {
++		// Mimi's merchant statement identifies refunds by the dakim operation ID.
++		proof.Refunds = append(proof.Refunds, provedRefund{r.ID, r.Amount})
++	}
++	return proof, nil
++}
+diff --git a/internal/server/settlement.go b/internal/server/settlement.go
+index 9124a4b..48e8bc1 100644
+--- a/internal/server/settlement.go
++++ b/internal/server/settlement.go
+@@ -46,6 +46,8 @@ func settlementCommand(ctx context.Context, tx pgx.Tx, a retail.Actor, action st
+ 		}
+ 		seen := map[string]bool{}
+ 		payouts := map[string]bool{p.Payout: true}
++		needsBankProof := false
++		_, readsBank := c.Adapter.(adjustmentReader)
+ 		for i := range p.Lines {
+ 			line := &p.Lines[i]
+ 			if line.Kind == "" {
+@@ -60,6 +62,9 @@ func settlementCommand(ctx context.Context, tx pgx.Tx, a retail.Actor, action st
+ 			if !line.valid() || seen[line.Reference] {
+ 				return nil, retail.Fail(422, "Invalid or repeated statement reference or amount.")
+ 			}
++			if line.Kind == "provider_refund" || (readsBank && line.Kind != "transaction") {
++				needsBankProof = true
++			}
+ 			seen[line.Reference] = true
+ 		}
+ 		var id string
+@@ -78,6 +83,11 @@ func settlementCommand(ctx context.Context, tx pgx.Tx, a retail.Actor, action st
+ 			records = append(records, []any{id, l.Reference, l.Gross, l.Fee, l.Kind, l.Original, l.Payout})
+ 		}
+ 		_, e = tx.CopyFrom(ctx, pgx.Identifier{"retail", "settlement_line"}, []string{"batch_id", "remote_id", "gross_minor", "fee_minor", "entry_kind", "original_ref", "payout_ref"}, pgx.CopyFromRows(records))
++		if e == nil && needsBankProof {
++			if _, e = tx.Exec(ctx, "INSERT INTO provider_statement_check(batch_id) VALUES($1)", id); e != nil {
++				return nil, e
++			}
++		}
+ 		return map[string]string{"id": id}, e
+ 	}
+ 	if action != "finance.settlement.close" && action != "finance.settlement.void" {
+@@ -123,6 +133,11 @@ func settlementCommand(ctx context.Context, tx pgx.Tx, a retail.Actor, action st
+             where b.id=$1 and m.entry_kind='transaction' and m.external_reversal`, p.ID); e != nil {
+ 			return nil, e
+ 		}
++		if _, err := tx.Exec(ctx, `INSERT INTO provider_refund_applied(provider,merchant,adjustment_id,batch_id)
++			SELECT b.provider,b.merchant,m.remote_id,b.id FROM settlement_match m JOIN settlement_batch b ON b.id=m.batch_id
++			WHERE b.id=$1 AND m.entry_kind='provider_refund'`, p.ID); err != nil {
++			return nil, err
++		}
+ 		status = "closed"
+ 	} else if len(strings.TrimSpace(p.Reason)) < 4 || len(p.Reason) > 240 || strings.IndexFunc(p.Reason, unicode.IsControl) >= 0 {
+ 		return nil, retail.Fail(422, "Give the reason for voiding this statement.")
+@@ -144,7 +159,7 @@ func (l statementLine) valid() bool {
+ 		return l.Gross != 0 && l.Original == ""
+ 	case "fee":
+ 		return l.Gross == 0 && l.Fee != 0 && l.Original == ""
+-	case "chargeback":
++	case "provider_refund", "chargeback":
+ 		return l.Gross < 0 && statementRef.MatchString(l.Original)
+ 	case "chargeback_reversal", "reserve_release":
+ 		return l.Gross > 0 && statementRef.MatchString(l.Original)
+@@ -236,7 +251,14 @@ func settlementView(ctx context.Context, tx pgx.Tx, a retail.Actor) (any, error)
+  s.opened_by<>$1 AND NOT EXISTS(SELECT FROM drawer_recovery d WHERE d.shift_id=s.id AND d.recovered_by=$1) AS "canReview"
+  FROM shift s JOIN staff u ON u.id=s.opened_by LEFT JOIN drawer_variance_review r ON r.shift_id=s.id
+  WHERE s.closed_at IS NOT NULL AND s.variance_minor<>0 AND r.shift_id IS NULL ORDER BY s.closed_at,s.id LIMIT 50`, a.ID)
+-	return map[string]any{"batches": batches, "unreconciled": open, "unsettledCount": unsettled, "drawerVariances": variances}, e
++	if e != nil {
++		return nil, e
++	}
++	refunds, e := maps(ctx, tx, `SELECT adjustment_id id,payment_ref original,order_ref "orderRef",receipt_id "receiptId",
++	original_payout "originalPayout",original_bank "originalBank",source_ref "sourceReference",currency,amount_minor "amountMinor",occurred_at "occurredAt",
++	CASE WHEN debit_batch_id IS NOT NULL THEN 'bank_matched' WHEN original_batch_id IS NULL THEN 'review_original' ELSE 'awaiting_bank' END status
++	FROM provider_refund_case ORDER BY (debit_batch_id IS NULL) DESC,sequence_no DESC LIMIT 100`)
++	return map[string]any{"providerRefunds": refunds, "batches": batches, "unreconciled": open, "unsettledCount": unsettled, "drawerVariances": variances}, e
+ }
+ func (s *Server) settlementLines(w http.ResponseWriter, r *http.Request) {
+ 	ctx := r.Context()
 diff --git a/scripts/mimi-dakim b/scripts/mimi-dakim
 new file mode 100755
 index 0000000..e563243
@@ -238,3 +483,1174 @@ index 0000000..e563243
 + stop|status) exec "$repo/scripts/mimi-local" "$1" ;;
 + *) echo 'Usage: scripts/mimi-dakim start|status|stop' >&2; exit 2 ;;
 +esac
+diff --git a/web/register.js b/web/register.js
+index 521a9a5..2962b28 100644
+--- a/web/register.js
++++ b/web/register.js
+@@ -37,6 +37,8 @@ let query = '',
+   searchTicket = 0;
+ const pickedProducts = new Map();
+ const trackedKey = () => 'mimi.card.v1.' + c.user.id;
++const receiptCloseKey = () => 'mimi.receipt-close.v1.' + c.user.id;
++let closingReceipt = '';
+ let lastCardStatus = '', lastCardHeld = false, kioskReceiptTimer = 0;
+ const legacyBuyGetNote = '<p>This receipt assigned the buy/get saving to the bonus item. Check the returned items and original offer before approving a partial refund.</p>';
+ const sharedBuyGetNote = '<p>Buy/get savings are shared across the qualifying items. Returns use the discounted line totals shown here.</p>';
+@@ -268,6 +270,13 @@ export function registerView() {
+   const kiosk = !regular(),
+     products = stocked(),
+     cats = [...new Set(products.map((p) => p.category).filter(Boolean))];
++  const pendingClose = kiosk && sessionStorage.getItem(receiptCloseKey());
++  if (pendingClose) {
++    return heading('Finishing checkout') + (closingReceipt === pendingClose
++      ? '<p role="status">Closing access to the previous receipt.</p>'
++      : '<p>Confirm that the previous receipt is closed before starting the next sale.</p>' +
++        button('Retry finish', 'card-finish', '', 'primary'));
++  }
+   if (kiosk) readHandoff();
+   if (!cats.includes(category)) category = '';
+   if (
+@@ -1123,15 +1132,27 @@ export async function recoveredCheckout(action, result) {
+ }
+ 
+ async function finishCustomerReceipt() {
+-  const id = tracked();
++  const actor = c.user.id, key = receiptCloseKey();
++  const id = sessionStorage.getItem(key) || tracked();
++  if (!id || id === closingReceipt) return;
++  sessionStorage.setItem(key, id);
++  closingReceipt = id;
+   clearTimeout(kioskReceiptTimer);
+-  // Always erase the onscreen copy, including a receipt dialog left open.
++  // Hide the customer's receipt immediately. Keep the next scanner behind
++  // this gate until the original receipt grant is closed, including on reload.
+   endModal();
+   forgetCard();
+   c.render();
+-  if (id) await api('/api/kiosk/receipt/' + encodeURIComponent(id), {
+-    method: 'DELETE', headers: { 'X-CSRF-Token': c.csrf },
+-  });
++  try {
++    const reply = await api('/api/kiosk/receipt/' + encodeURIComponent(id), {
++      method: 'DELETE', headers: { 'X-CSRF-Token': c.csrf }, signal: AbortSignal.timeout(15000),
++    });
++    if (reply?.receipt !== null) throw Error('The store did not confirm that the receipt closed.');
++    if (sessionStorage.getItem(key) === id) sessionStorage.removeItem(key);
++  } finally {
++    if (closingReceipt === id) closingReceipt = '';
++    if (c.user?.id === actor) c.render();
++  }
+ }
+ 
+ export function noteKioskActivity() {
+diff --git a/web/settlement.js b/web/settlement.js
+index 596b85c..10c9d03 100644
+--- a/web/settlement.js
++++ b/web/settlement.js
+@@ -32,6 +32,18 @@ export function settlementPanel() {
+     esc(row.provider),
+     esc(money(row.grossMinor, row.currency)),
+   ]);
++  const refundStates = {
++    awaiting_bank: 'Awaiting bank debit',
++    review_original: 'Check original receipt and deposit',
++    bank_matched: 'Bank debit matched',
++  };
++  const providerRefunds = list(book.providerRefunds).map((row) => [
++    esc(row.receiptId || row.orderRef) + '<small>' + esc(row.original) + '</small>',
++    esc(row.id) + '<small>' + esc(row.sourceReference) + '</small>',
++    esc(row.originalPayout) + '<small>' + esc(row.originalBank) + '</small>',
++    esc(money(-row.amountMinor, row.currency)),
++    esc(refundStates[row.status] || row.status),
++  ]);
+   return (
+     panel(
+       'Cash-up differences awaiting review',
+@@ -60,6 +72,13 @@ export function settlementPanel() {
+       button('Import statement', 'settlement-import', '', 'secondary') +
+         button('Find statement', 'settlement-find', '', 'quiet'),
+     ) +
++    (providerRefunds.length
++      ? panel(
++          'Provider refunds after sale',
++          '<p>Bank matching posts the debit to provider refund suspense. Finance reviews any goods or tax adjustment separately.</p>' +
++            table(['Receipt / original payment', 'Provider refund', 'Original payout', 'Debit', 'Bank reconciliation'], providerRefunds),
++        )
++      : '') +
+     panel(
+       'Card transactions awaiting reconciliation',
+       (book.unsettledCount > awaiting.length
+diff --git a/webtest/lane.cjs b/webtest/lane.cjs
+index d1c2882..3d4837a 100644
+--- a/webtest/lane.cjs
++++ b/webtest/lane.cjs
+@@ -184,12 +184,29 @@ async function customerReceipt(page, manager) {
+   await page.locator('[data-act=print]').click();
+   await page.waitForFunction(() => window.printCalls === 2);
+   await page.locator('dialog [data-act=dismiss]').first().click();
++  const deleted = signal(), dropReply = signal();
++  await page.route(path, async (route) => {
++    if (route.request().method() !== 'DELETE') return route.continue();
++    const reply = await route.fetch();
++    assert.equal(reply.status(), 200);
++    deleted.resolve();
++    await dropReply.promise;
++    await route.abort('failed');
++  }, {times: 1});
+   await page.locator('[data-act=card-finish]').click();
+-  await page.getByRole('heading', { name: 'Self-checkout' }).waitFor();
++  await deleted.promise;
++  await page.getByRole('heading', {name:'Finishing checkout'}).waitFor();
++  assert.equal(await page.locator('#scan, .receipt-head, [data-act=customer-receipt]').count(), 0);
+   const closed = await page.request.get(path);
+   assert.equal(closed.status(), 404);
+-  assert.equal(await page.locator('.receipt-head').count(), 0);
+-  console.log('PASS itemized current kiosk receipt, reload, print retries and expiry on Finish');
++  dropReply.resolve();
++  await page.getByRole('button', {name:'Retry finish'}).waitFor();
++  await page.reload();
++  await page.getByRole('button', {name:'Retry finish'}).waitFor();
++  assert.equal(await page.locator('#scan, .receipt-head, [data-act=customer-receipt]').count(), 0);
++  await page.getByRole('button', {name:'Retry finish'}).click();
++  await page.locator('#scan').waitFor();
++  console.log('PASS kiosk receipt, print retries, lost Finish acknowledgement and reload before next scanner');
+ }
+ async function customerScanReview(kiosk, newStaff) {
+   await input(kiosk, 'UNRECOGNISED-KIOSK-ITEM');
+diff --git a/migrations/135_provider_refunds.sql b/migrations/135_provider_refunds.sql
+new file mode 100644
+index 0000000..97ad6f4
+--- /dev/null
++++ b/migrations/135_provider_refunds.sql
+@@ -0,0 +1,107 @@
++-- Evidence of money returned after a receipted sale. The provider refund does
++-- not establish which items came back or how tax and stock should be treated.
++CREATE TABLE provider_refund_notice (
++ provider text NOT NULL, merchant text NOT NULL, sequence_no bigint NOT NULL CHECK(sequence_no>0),
++ adjustment_id text NOT NULL, payment_ref text NOT NULL, order_ref text NOT NULL, attempt_ref text NOT NULL,
++ charge_ref text NOT NULL, source_operation text NOT NULL, source_ref text NOT NULL,
++ amount_minor bigint NOT NULL CHECK(amount_minor>0), currency text NOT NULL,
++ original_payout text NOT NULL, original_bank text NOT NULL, original_deposit_minor bigint NOT NULL, occurred_at timestamptz NOT NULL, observed_at timestamptz NOT NULL DEFAULT now(),
++ PRIMARY KEY(provider,merchant,adjustment_id), UNIQUE(provider,merchant,sequence_no),
++ UNIQUE(provider,merchant,source_operation), UNIQUE(provider,merchant,source_ref)
++);
++CREATE INDEX provider_refund_original ON provider_refund_notice(provider,merchant,payment_ref);
++CREATE TRIGGER retain_provider_refund BEFORE UPDATE OR DELETE ON provider_refund_notice
++ FOR EACH ROW EXECUTE FUNCTION protect_history();
++
++-- The intake verifies the provider's matched statement outside the till writer
++-- lock. A finance user may import a candidate before the evidence is available.
++CREATE TABLE provider_statement_check (
++ batch_id text PRIMARY KEY REFERENCES settlement_batch,
++ next_check timestamptz NOT NULL DEFAULT now(), verified_at timestamptz,
++ last_message text NOT NULL DEFAULT 'Awaiting independent bank evidence'
++);
++-- Seal all lines and financial terms as soon as the candidate is imported.
++-- Finance can void an incorrect import and enter a corrected statement.
++CREATE OR REPLACE FUNCTION check_statement_open() RETURNS trigger LANGUAGE plpgsql AS $$
++BEGIN
++ PERFORM 1 FROM settlement_batch WHERE id=NEW.batch_id AND status='open' FOR SHARE;
++ IF NOT FOUND OR EXISTS(SELECT FROM provider_statement_check WHERE batch_id=NEW.batch_id)
++ THEN RAISE EXCEPTION 'statement lines are sealed' USING ERRCODE='23514'; END IF;
++ RETURN NEW;
++END $$;
++CREATE FUNCTION protect_imported_payout() RETURNS trigger LANGUAGE plpgsql AS $$
++BEGIN
++ IF (NEW.provider,NEW.merchant,NEW.payout_ref,NEW.currency,NEW.deposit_minor,NEW.bank_ref,NEW.created_by)
++ IS DISTINCT FROM (OLD.provider,OLD.merchant,OLD.payout_ref,OLD.currency,OLD.deposit_minor,OLD.bank_ref,OLD.created_by)
++ AND EXISTS(SELECT FROM provider_statement_check WHERE batch_id=OLD.id)
++ THEN RAISE EXCEPTION 'imported payout terms are sealed' USING ERRCODE='23514'; END IF;
++ RETURN NEW;
++END $$;
++CREATE TRIGGER keep_verified_statement_terms BEFORE UPDATE ON settlement_batch
++ FOR EACH ROW EXECUTE FUNCTION protect_imported_payout();
++
++CREATE TABLE provider_refund_applied (
++ provider text NOT NULL, merchant text NOT NULL, adjustment_id text NOT NULL,
++ batch_id text NOT NULL REFERENCES settlement_batch, PRIMARY KEY(provider,merchant,adjustment_id),
++ FOREIGN KEY(provider,merchant,adjustment_id) REFERENCES provider_refund_notice(provider,merchant,adjustment_id),
++ FOREIGN KEY(batch_id,adjustment_id) REFERENCES settlement_line(batch_id,remote_id)
++);
++CREATE TRIGGER retain_provider_refund_match BEFORE UPDATE OR DELETE ON provider_refund_applied
++ FOR EACH ROW EXECUTE FUNCTION protect_history();
++
++ALTER TABLE settlement_line DROP CONSTRAINT settlement_line_entry_kind_check,
++ ADD CHECK(entry_kind IN ('transaction','fee','chargeback','chargeback_reversal','reserve_hold','reserve_release','provider_refund')),
++ ADD CHECK(entry_kind<>'provider_refund' OR (gross_minor<0 AND original_ref<>''));
++
++CREATE VIEW provider_refund_case AS
++ SELECT n.*,c.receipt_id, b.id AS original_batch_id,ap.batch_id AS debit_batch_id
++ FROM provider_refund_notice n
++ LEFT JOIN card_attempt c ON (c.provider,c.merchant,c.id,c.remote_id,c.currency) =
++ (n.provider,n.merchant,n.attempt_ref,n.payment_ref,n.currency)
++ AND c.kind='charge' AND c.status='succeeded' AND c.receipt_id IS NOT NULL
++ AND c.amount_minor >= (SELECT sum(other.amount_minor) FROM provider_refund_notice other
++  WHERE (other.provider,other.merchant,other.payment_ref)=(n.provider,n.merchant,n.payment_ref)
++  AND other.sequence_no<=n.sequence_no) + (SELECT coalesce(sum(r.amount_minor),0) FROM card_attempt r
++  WHERE (r.provider,r.merchant,r.original_ref,r.currency)=(n.provider,n.merchant,n.payment_ref,n.currency)
++  AND r.kind='refund' AND r.status='succeeded')
++ LEFT JOIN settlement_applied s ON s.attempt_id=c.id AND s.remote_id=n.payment_ref
++ LEFT JOIN settlement_batch b ON b.id=s.batch_id AND b.status='closed' AND b.provider=n.provider
++ AND b.merchant=n.merchant AND b.currency=n.currency AND b.bank_ref=n.original_bank AND b.deposit_minor=n.original_deposit_minor AND EXISTS(SELECT FROM settlement_evidence p
++ WHERE p.batch_id=b.id AND p.evidence_type='payout' AND p.reference=n.original_payout)
++ LEFT JOIN provider_refund_applied ap ON (ap.provider,ap.merchant,ap.adjustment_id)=(n.provider,n.merchant,n.adjustment_id);
++
++ALTER VIEW settlement_match RENAME TO settlement_before_provider_refunds;
++CREATE VIEW settlement_match AS
++ SELECT m.batch_id,m.remote_id,m.gross_minor,m.fee_minor,m.attempt_id,
++ CASE WHEN n.adjustment_id IS NOT NULL THEN -n.amount_minor ELSE m.expected_minor END expected_minor,
++ CASE WHEN n.adjustment_id IS NOT NULL AND m.entry_kind<>'provider_refund' THEN 'provider refund classified incorrectly'
++ WHEN chk.batch_id IS NOT NULL AND chk.verified_at IS NULL THEN chk.last_message
++ WHEN m.entry_kind<>'provider_refund' THEN m.result
++ WHEN n.adjustment_id IS NULL OR n.original_batch_id IS NULL THEN 'verified provider refund or original settled receipt missing'
++ WHEN n.currency<>b.currency OR n.payment_ref<>m.original_ref OR m.gross_minor<>-n.amount_minor THEN 'provider refund terms differ'
++ WHEN chk.verified_at IS NULL THEN 'independent bank evidence missing'
++ WHEN n.debit_batch_id IS NOT NULL AND n.debit_batch_id<>b.id THEN 'already reconciled'
++ WHEN m.result<>'matched' THEN m.result ELSE 'matched' END result,
++ m.entry_kind,m.original_ref,m.payout_ref,m.external_reversal
++ FROM settlement_before_provider_refunds m JOIN settlement_batch b ON b.id=m.batch_id
++ LEFT JOIN provider_refund_case n ON (n.provider,n.merchant,n.adjustment_id)=(b.provider,b.merchant,m.remote_id)
++ LEFT JOIN provider_statement_check chk ON chk.batch_id=b.id;
++
++CREATE OR REPLACE FUNCTION post_settlement(batch_key text) RETURNS void LANGUAGE plpgsql AS $$
++DECLARE residual numeric;
++BEGIN
++ INSERT INTO settlement_journal(batch_id,account,amount_minor)
++ SELECT batch_key,account,sum(amount)::bigint FROM (
++   SELECT 'bank' AS account,deposit_minor AS amount FROM settlement_batch WHERE id=batch_key AND status='closed'
++   UNION ALL SELECT 'processing_fees',fee_minor FROM settlement_line WHERE batch_id=batch_key
++   UNION ALL SELECT CASE l.entry_kind
++     WHEN 'transaction' THEN CASE WHEN e.batch_id IS NULL THEN 'card_clearing' ELSE 'unreceipted_card_clearing' END
++     WHEN 'provider_refund' THEN 'provider_refund_suspense'
++     WHEN 'chargeback' THEN 'chargebacks' WHEN 'chargeback_reversal' THEN 'chargebacks'
++     WHEN 'reserve_hold' THEN 'processor_reserve' WHEN 'reserve_release' THEN 'processor_reserve' END,
++     -l.gross_minor FROM settlement_line l LEFT JOIN external_reversal_applied e USING(batch_id,remote_id)
++     WHERE l.batch_id=batch_key AND l.entry_kind<>'fee'
++ ) entries GROUP BY account HAVING sum(amount)<>0;
++ SELECT coalesce(sum(amount_minor),0) INTO residual FROM settlement_journal WHERE batch_id=batch_key;
++ IF residual<>0 THEN RAISE EXCEPTION 'payout must balance before close' USING ERRCODE='23514'; END IF;
++END $$;
+diff --git a/internal/server/dakim_terminal_test.go b/internal/server/dakim_terminal_test.go
+new file mode 100644
+index 0000000..bc9e3c4
+--- /dev/null
++++ b/internal/server/dakim_terminal_test.go
+@@ -0,0 +1,497 @@
++package server
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestDakimOriginalCaptureRequiresCompleteRefundEvidence(t *testing.T) {
++	const base = `{"id":"dp_sale","merchant_id":"mimi","order_id":"MIMI-order","terminal_id":"MIMI-01","channel":"terminal","brand":"visa","amount":720,"currency":"USD","reference":"ch_sale","status":"captured"`
++	job := CardJob{ID: "order", Kind: "charge", Remote: "dp_sale", Amount: 720, Currency: "USD", Digits: 2, Merchant: "mimi", Provider: "dakim-simulator", Reader: "MIMI-01"}
++	for _, tc := range []struct {
++		name, suffix      string
++		success, reversed bool
++	}{
++		{"omitted", "}", false, false}, {"null", `,"refunded":null}`, false, false},
++		{"negative", `,"refunded":-1}`, false, false}, {"above capture", `,"refunded":721}`, false, false},
++		{"partial", `,"refunded":300}`, false, true}, {"full", `,"refunded":720}`, false, true},
++		{"zero", `,"refunded":0}`, true, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			h := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if r.Method == "GET" && r.URL.Path == "/v1/payments/dp_sale/reversal-evidence" {
++					fmt.Fprint(w, `{"complete":true,"dispute_status":"none","refunds":[],"payment":`+base+tc.suffix+"}")
++					return
++				}
++				if r.Method != "GET" || r.URL.Path != "/v1/payments/dp_sale" {
++					http.Error(w, "unexpected operation", 400)
++					return
++				}
++				fmt.Fprint(w, base+tc.suffix)
++			}))
++			defer h.Close()
++			d := DakimSimulator{base: h.URL, client: h.Client()}
++			f, err := d.OriginalReference(context.Background(), job)
++			if (err == nil) != tc.success || (f.State == "succeeded") != tc.success || errors.Is(err, errReversedReference) != tc.reversed {
++				t.Fatalf("recovery evidence: %+v, %v", f, err)
++			}
++		})
++	}
++}
++
++// The same authenticated command can reach the store on independent connections.
++// Release both clients together and observe the HTTP results outside their goroutines.
++func retrySameCommand(t *testing.T, s *officeHTTPSession, action string, input map[string]any, key string) string {
++	t.Helper()
++	body, err := json.Marshal(map[string]any{"action": action, "input": input})
++	if err != nil {
++		t.Fatal(err)
++	}
++	type reply struct {
++		id  string
++		err error
++	}
++	var replies [2]reply
++	start := make(chan struct{})
++	var wg sync.WaitGroup
++	for i := range replies {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			req, e := http.NewRequest("POST", s.base+"/api/command", bytes.NewReader(body))
++			if e != nil {
++				replies[i].err = e
++				return
++			}
++			req.Header.Set("Origin", s.base)
++			req.Header.Set("Content-Type", "application/json")
++			req.Header.Set("X-CSRF-Token", s.csrf)
++			req.Header.Set("Idempotency-Key", key)
++			<-start
++			resp, e := s.client.Do(req)
++			if e != nil {
++				replies[i].err = e
++				return
++			}
++			defer resp.Body.Close()
++			var v struct {
++				Result struct{ ID string }
++				Error  string
++			}
++			e = json.NewDecoder(resp.Body).Decode(&v)
++			if e == nil && (resp.StatusCode != 200 || v.Result.ID == "") {
++				e = fmt.Errorf("status %d: %s", resp.StatusCode, v.Error)
++			}
++			replies[i] = reply{v.Result.ID, e}
++		}()
++	}
++	close(start)
++	wg.Wait()
++	if replies[0].err != nil || replies[1].err != nil || replies[0].id != replies[1].id {
++		t.Fatalf("concurrent %s replies: %+v", action, replies)
++	}
++	return replies[0].id
++}
++
++// A local HTTP supplier stores one capture before its confirmation is lost.
++// It subsequently serves incomplete evidence and an older, delayed observation.
++// Only the current worker with complete evidence may post the retail ledger.
++func TestDakimRegisterRecoveryFencesDelayedEvidence(t *testing.T) {
++	const paymentRef, refundRef = "dp_merchant_test", "dr_merchant_test"
++	type input = map[string]any
++	var chargeOperation, refundOperation atomic.Value
++	var createdChecks, refundChecks, captureWrites atomic.Int32
++	leaseWaiting, releaseLease := make(chan struct{}), make(chan struct{})
++	var unblock sync.Once
++	release := func() { unblock.Do(func() { close(releaseLease) }) }
++	acquirer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Header.Get("Authorization") != "Bearer 0123456789abcdef0123456789abcdef" {
++			http.Error(w, "unbound merchant", 403)
++			return
++		}
++		reply := func(v input) { w.Header().Set("Content-Type", "application/json"); _ = json.NewEncoder(w).Encode(v) }
++		charge := func() input {
++			return input{"id": paymentRef, "merchant_id": "mimi", "order_id": "MIMI-" + chargeOperation.Load().(string), "currency": "USD", "amount": 720, "channel": "terminal", "terminal_id": "MIMI-01", "brand": "visa", "status": "captured", "reference": "test_capture", "refunded": 0}
++		}
++		refund := func() input {
++			return input{"id": refundRef, "merchant_id": "mimi", "payment_id": paymentRef, "merchant_operation": refundOperation.Load().(string), "currency": "USD", "amount": 360, "status": "succeeded", "reference": "test_refund"}
++		}
++		switch r.Method + " " + r.URL.Path {
++		case "POST /v1/payments":
++			key := r.Header.Get("Idempotency-Key")
++			if chargeOperation.CompareAndSwap(nil, key) {
++				captureWrites.Add(1)
++				panic(http.ErrAbortHandler)
++			}
++			if key != chargeOperation.Load().(string) {
++				http.Error(w, "operation changed", 409)
++				return
++			}
++			reply(charge())
++		case "GET /v1/payments/" + paymentRef + "/reversal-evidence":
++			reply(input{"complete": true, "dispute_status": "none", "payment": charge(), "refunds": []input{}})
++		case "POST /v1/payments/" + paymentRef + "/recover":
++			v := charge()
++			switch createdChecks.Add(1) {
++			case 1:
++				delete(v, "refunded") // A captured label with incomplete proof.
++			case 2:
++				close(leaseWaiting)
++				<-releaseLease // An old response arrives after another lease posts the receipt.
++				v["status"] = "unknown"
++				v["reference"] = ""
++			}
++			reply(v)
++		case "POST /v1/payments/" + paymentRef + "/refunds":
++			key := r.Header.Get("Idempotency-Key")
++			refundOperation.CompareAndSwap(nil, key)
++			if key != refundOperation.Load().(string) {
++				http.Error(w, "refund operation changed", 409)
++				return
++			}
++			reply(refund())
++		case "POST /v1/refunds/" + refundRef + "/recover":
++			v := refund()
++			if refundChecks.Add(1) == 1 {
++				v["merchant_operation"] = "unrelated-refund-for-same-amount"
++			}
++			reply(v)
++		default:
++			http.NotFound(w, r)
++		}
++	}))
++	defer acquirer.Close()
++	defer release()
++	tokenFile := filepath.Join(t.TempDir(), "merchant.key")
++	if err := os.WriteFile(tokenFile, []byte("0123456789abcdef0123456789abcdef"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("MIMI_CARD_MODE", "dakim-simulator")
++	t.Setenv("MIMI_DAKIM_URL", acquirer.URL)
++	t.Setenv("MIMI_DAKIM_TOKEN_FILE", tokenFile)
++	ctx := context.Background()
++	db, worker, staff, _ := officeHTTPStore(t, TrainingProfile())
++	// This fixture names the staffed till L1, while the enrolled demo store calls it Lane 1.
++	worker.Readers["L1"] = worker.Readers["Lane 1"]
++	cash, manager, fin := staff["cashier"], staff["supervisor"], staff["finance"]
++	check := func(want int64, sql string, args ...any) {
++		t.Helper()
++		var n int64
++		if err := db.QueryRow(ctx, sql, args...).Scan(&n); err != nil || n != want {
++			t.Fatalf("%s got %d, want %d: %v", sql, n, want, err)
++		}
++	}
++	due := func() {
++		t.Helper()
++		if _, err := db.Exec(ctx, `UPDATE card_attempt SET next_check=now(),lease_until=now()-interval '1 second' WHERE status IN ('queued','processing','unknown')`); err != nil {
++			t.Fatal(err)
++		}
++	}
++	step := func(c *CardService) {
++		t.Helper()
++		due()
++		if worked, err := c.Step(ctx); err != nil || !worked {
++			t.Fatalf("scheduled worker: %t, %v", worked, err)
++		}
++	}
++	basket := func() input {
++		return cash.request("GET", "/api/state?view=register", nil, "", 200)["commerce"].(input)["basket"].(input)
++	}
++	cash.command("commerce.open", input{}, "", 200)
++	for range 2 {
++		b := basket()
++		cash.command("commerce.add", input{"basketId": b["id"], "version": b["version"], "code": "EGGS"}, "", 200)
++	}
++	b := basket()
++	pay := input{"basketId": b["id"], "version": b["version"], "expectedTotalMinor": 720, "quoteKey": b["quoteKey"]}
++	key := newOfficeKey()
++	attempt := retrySameCommand(t, cash, "commerce.card.start", pay, key)
++	step(worker) // Provider committed; the response never arrived.
++	check(1, "SELECT count(*) FROM card_attempt WHERE id=$1 AND status='unknown' AND remote_id=''", attempt)
++	if cash.command("commerce.card.start", pay, key, 200)["id"] != attempt {
++		t.Fatal("lost-reply replay changed the attempt")
++	}
++	restarted, err := CardConfig(db, TrainingProfile().Store)
++	if err != nil {
++		t.Fatal(err)
++	}
++	step(restarted)
++	step(restarted)
++	step(restarted) // Rebind, dispatch, inspect incomplete evidence.
++	check(1, "SELECT count(*) FROM card_attempt WHERE id=$1 AND status='unknown'", attempt)
++	check(0, "SELECT count(*) FROM register_receipt WHERE basket_id=$1", b["id"])
++	due()
++	oldDone := make(chan error, 1)
++	go func() { _, err := worker.Step(ctx); oldDone <- err }()
++	select {
++	case <-leaseWaiting:
++	case <-time.After(5 * time.Second):
++		t.Fatal("older worker did not enter provider inspection")
++	}
++	step(restarted)
++	release()
++	if err := <-oldDone; err != nil {
++		t.Fatal(err)
++	}
++	var sale string
++	if err := db.QueryRow(ctx, "SELECT receipt_id FROM card_attempt WHERE id=$1 AND status='succeeded' AND remote_id=$2", attempt, paymentRef).Scan(&sale); err != nil {
++		t.Fatal(err)
++	}
++	if captureWrites.Load() != 1 {
++		t.Fatal("extra provider captures", captureWrites.Load())
++	}
++	check(1, "SELECT count(*) FROM register_receipt WHERE basket_id=$1", b["id"])
++	check(1, "SELECT count(*) FROM audit_log WHERE action='terminal.charge' AND object_id=$1", attempt)
++	check(720, "SELECT amount_minor FROM tender_journal WHERE source_id=$1 AND account='card_clearing'", sale)
++	check(0, "SELECT sum(amount_minor) FROM tender_journal WHERE source_id=$1", sale)
++	rid := retrySameCommand(t, cash, "commerce.refundRequest", input{"receiptId": sale, "sku": "EGGS", "qtyMilli": 1000, "reason": "Partial return after recovery"}, newOfficeKey())
++	cash.command("commerce.refundApprove", input{"refundId": rid}, "", 403)
++	retrySameCommand(t, manager, "commerce.refundApprove", input{"refundId": rid}, newOfficeKey())
++	step(restarted)
++	step(restarted) // Equal amount on another refund never authorizes this one.
++	check(1, "SELECT count(*) FROM register_refund WHERE id=$1 AND status='processing'", rid)
++	check(0, "SELECT count(*) FROM tender_journal WHERE source_id=$1", rid)
++	step(restarted)
++	check(1, "SELECT count(*) FROM card_attempt WHERE refund_id=$1 AND status='succeeded' AND remote_id=$2 AND original_ref=$3", rid, refundRef, paymentRef)
++	check(-360, "SELECT amount_minor FROM tender_journal WHERE source_id=$1 AND account='card_clearing'", rid)
++	check(0, "SELECT sum(amount_minor) FROM tender_journal WHERE source_id=$1", rid)
++	batch := fin.command("finance.settlement.import", input{"payout": "SIM-LEASE-P", "bank": "SIM-LEASE-B", "currency": "USD", "depositMinor": 346,
++		"lines": []input{{"reference": paymentRef, "grossMinor": 720, "feeMinor": 14}, {"reference": refundRef, "grossMinor": -360, "feeMinor": 0}}}, "", 200)["id"]
++	fin.command("finance.settlement.close", input{"id": batch}, "", 403)
++	retrySameCommand(t, manager, "finance.settlement.close", input{"id": batch}, newOfficeKey())
++	check(346, "SELECT amount_minor FROM settlement_journal WHERE batch_id=$1 AND account='bank'", batch)
++	check(14, "SELECT amount_minor FROM settlement_journal WHERE batch_id=$1 AND account='processing_fees'", batch)
++	check(-360, "SELECT amount_minor FROM settlement_journal WHERE batch_id=$1 AND account='card_clearing'", batch)
++	check(0, "SELECT sum(amount_minor) FROM settlement_journal WHERE batch_id=$1", batch)
++	check(0, "SELECT count(*) FROM unsettled_card")
++}
++
++type dakimTestFields = map[string]any
++
++// All fields below are supplied by the synthetic provider. Tests mutate one
++// claim at a time to ensure each missing or ambiguous fact keeps the order held.
++func testDakimReversal(order string, first, second int64) dakimTestFields {
++	legs := []dakimTestFields{}
++	for i, amount := range []int64{first, second} {
++		if amount == 0 {
++			continue
++		}
++		legs = append(legs, dakimTestFields{
++			"id": fmt.Sprintf("dr_test_%d", i), "payment_id": "dp_sale",
++			"merchant_id": "mimi", "currency": "USD", "amount": amount, "status": "succeeded",
++			"reference": fmt.Sprintf("rf_test-%d", i), "merchant_operation": fmt.Sprintf("external-%d", i),
++			"charge_reference": "ch_test-sale",
++		})
++	}
++	return dakimTestFields{"complete": true, "dispute_status": "none", "refunds": legs, "payment": dakimTestFields{
++		"id": "dp_sale", "merchant_id": "mimi", "order_id": "MIMI-" + order, "terminal_id": "MIMI-01",
++		"channel": "terminal", "brand": "visa", "status": "captured", "reference": "ch_test-sale", "amount": 360, "currency": "USD", "refunded": first + second,
++	}}
++}
++
++func TestDakimFullReversalRequiresCompleteBoundLegs(t *testing.T) {
++	job := CardJob{ID: "order", Kind: "charge", Remote: "dp_sale", Amount: 360, Currency: "USD", Digits: 2, Merchant: "mimi", Provider: "dakim-simulator", Reader: "MIMI-01"}
++	type mutate func(dakimTestFields, dakimTestFields, []dakimTestFields)
++	cases := []struct {
++		name   string
++		change mutate
++		allow  bool
++	}{
++		{"complete", nil, true},
++		{"false completeness", func(v, p dakimTestFields, r []dakimTestFields) { v["complete"] = false }, false},
++		{"missing dispute", func(v, p dakimTestFields, r []dakimTestFields) { delete(v, "dispute_status") }, false},
++		{"open dispute", func(v, p dakimTestFields, r []dakimTestFields) { v["dispute_status"] = "open" }, false},
++		{"unknown dispute scope", func(v, p dakimTestFields, r []dakimTestFields) { v["dispute_status"] = "unknown" }, false},
++		{"unrecognized dispute evidence", func(v, p dakimTestFields, r []dakimTestFields) { v["dispute_status"] = "clearish" }, false},
++		{"pending refund", func(v, p dakimTestFields, r []dakimTestFields) { r[0]["status"] = "pending" }, false},
++		{"payment ID", func(v, p dakimTestFields, r []dakimTestFields) { p["id"] = "dp_other" }, false},
++		{"terminal", func(v, p dakimTestFields, r []dakimTestFields) { p["terminal_id"] = "MIMI-02" }, false},
++		{"order", func(v, p dakimTestFields, r []dakimTestFields) { p["order_id"] = "MIMI-another" }, false},
++		{"merchant", func(v, p dakimTestFields, r []dakimTestFields) { p["merchant_id"] = "other" }, false},
++		{"unconfirmed authorization", func(v, p dakimTestFields, r []dakimTestFields) { p["status"] = "authorized" }, false},
++		{"source missing charge", func(v, p dakimTestFields, r []dakimTestFields) { delete(p, "reference") }, false},
++		{"wrong leg parent", func(v, p dakimTestFields, r []dakimTestFields) { r[0]["payment_id"] = "dp_other" }, false},
++		{"wrong leg source charge", func(v, p dakimTestFields, r []dakimTestFields) { r[0]["charge_reference"] = "ch_other" }, false},
++		{"wrong leg merchant", func(v, p dakimTestFields, r []dakimTestFields) { r[0]["merchant_id"] = "other" }, false},
++		{"wrong leg currency", func(v, p dakimTestFields, r []dakimTestFields) { r[0]["currency"] = "EUR" }, false},
++		{"duplicate refund", func(v, p dakimTestFields, r []dakimTestFields) { r[1]["id"] = r[0]["id"] }, false},
++		{"duplicate provider reference", func(v, p dakimTestFields, r []dakimTestFields) { r[1]["reference"] = r[0]["reference"] }, false},
++		{"duplicate request", func(v, p dakimTestFields, r []dakimTestFields) {
++			r[1]["merchant_operation"] = r[0]["merchant_operation"]
++		}, false},
++		{"excess refund", func(v, p dakimTestFields, r []dakimTestFields) { r[0]["amount"] = int64(1<<63 - 1) }, false},
++		{"aggregate mismatches lines", func(v, p dakimTestFields, r []dakimTestFields) { p["refunded"] = 359 }, false},
++		{"missing line list", func(v, p dakimTestFields, r []dakimTestFields) { delete(v, "refunds") }, false},
++		{"only partial", func(v, p dakimTestFields, r []dakimTestFields) { v["refunds"] = r[:1]; p["refunded"] = 100 }, false},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			reply := testDakimReversal(job.ID, 100, 260)
++			if tc.change != nil {
++				tc.change(reply, reply["payment"].(dakimTestFields), reply["refunds"].([]dakimTestFields))
++			}
++			httpProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if r.Method != "GET" || r.URL.RequestURI() != "/v1/payments/dp_sale/reversal-evidence" || r.Header.Get("Authorization") != "Bearer merchant" || r.Header.Get("Idempotency-Key") != "" {
++					t.Error("unexpected original evidence request", r.Method, r.URL.Path)
++					http.NotFound(w, r)
++					return
++				}
++				_ = json.NewEncoder(w).Encode(reply)
++			}))
++			defer httpProvider.Close()
++			adapter := DakimSimulator{base: httpProvider.URL, client: httpProvider.Client(), token: "merchant"}
++			proof, err := adapter.FullReversal(context.Background(), job)
++			if !tc.allow {
++				if err == nil || proof.Charge != "" || len(proof.Refunds) != 0 {
++					t.Fatal("accepted incomplete or misbound evidence", proof, err)
++				}
++				return
++			}
++			if err != nil || proof.Charge != "ch_test-sale" || len(proof.Refunds) != 2 || proof.Refunds[0] != (provedRefund{"dr_test_0", 100}) || proof.Refunds[1] != (provedRefund{"dr_test_1", 260}) {
++				t.Fatal(proof, err)
++			}
++		})
++	}
++}
++
++func TestDakimUnknownRefundHoldsFirstCreateAcrossReplayWindow(t *testing.T) {
++	const token = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
++	var order atomic.Value
++	var creates atomic.Int32
++	var evidence atomic.Value
++	evidence.Store("pending")
++	acq := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Header.Get("Authorization") != "Bearer "+token {
++			http.Error(w, "wrong credential", 403)
++			return
++		}
++		switch r.Method + " " + r.URL.Path {
++		case "POST /v1/payments":
++			creates.Add(1)
++			order.Store(r.Header.Get("Idempotency-Key"))
++			_ = json.NewEncoder(w).Encode(testDakimReversal(order.Load().(string), 0, 0)["payment"])
++		case "POST /v1/payments/dp_sale/recover":
++			// Older summary still reports a clean capture while the independent snapshot has advanced.
++			_ = json.NewEncoder(w).Encode(testDakimReversal(order.Load().(string), 0, 0)["payment"])
++		case "GET /v1/payments/dp_sale/reversal-evidence":
++			if evidence.Load() == "pending" {
++				http.Error(w, "refund reservation pending", 409)
++				return
++			}
++			v := testDakimReversal(order.Load().(string), 0, 0)
++			v["dispute_status"] = evidence.Load().(string)
++			if evidence.Load() == "full" {
++				v = testDakimReversal(order.Load().(string), 100, 260)
++			}
++			_ = json.NewEncoder(w).Encode(v)
++		default:
++			t.Errorf("unexpected operation %s %s", r.Method, r.URL.Path)
++			http.NotFound(w, r)
++		}
++	}))
++	defer acq.Close()
++	tokenFile := filepath.Join(t.TempDir(), "merchant.key")
++	if err := os.WriteFile(tokenFile, []byte(token), 0600); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("MIMI_CARD_MODE", "dakim-simulator")
++	t.Setenv("MIMI_DAKIM_URL", acq.URL)
++	t.Setenv("MIMI_DAKIM_TOKEN_FILE", tokenFile)
++	ctx := context.Background()
++	db, worker, staff, _ := officeHTTPStore(t, TrainingProfile())
++	worker.Readers["L1"] = worker.Readers["Lane 1"]
++	cash, owner, finance := staff["cashier"], staff["owner-a"], staff["finance"]
++	step := func() {
++		t.Helper()
++		if _, err := db.Exec(ctx, `UPDATE card_attempt SET next_check=now() WHERE status IN ('queued','unknown','processing')`); err != nil {
++			t.Fatal(err)
++		}
++		if did, err := worker.Step(ctx); !did || err != nil {
++			t.Fatal(did, err)
++		}
++	}
++	cash.command("commerce.open", dakimTestFields{}, "", 200)
++	basket := func() dakimTestFields {
++		return cash.request("GET", "/api/state?view=register", nil, "", 200)["commerce"].(dakimTestFields)["basket"].(dakimTestFields)
++	}
++	b := basket()
++	cash.command("commerce.add", dakimTestFields{"basketId": b["id"], "version": b["version"], "code": "EGGS"}, "", 200)
++	b = basket()
++	id := cash.command("commerce.card.start", dakimTestFields{"basketId": b["id"], "version": b["version"], "quoteKey": b["quoteKey"], "expectedTotalMinor": 360}, "", 200)["id"]
++	stage := func(want string) {
++		t.Helper()
++		var got, remote string
++		var receipted bool
++		if err := db.QueryRow(ctx, `SELECT stage,remote_id,receipt_id IS NOT NULL FROM card_attempt WHERE id=$1`, id).Scan(&got, &remote, &receipted); err != nil || got != want || remote != "dp_sale" || receipted {
++			t.Fatal(got, remote, receipted, err)
++		}
++	}
++	step()
++	stage("inspect")
++	if _, err := db.Exec(ctx, `UPDATE card_attempt SET created_at=now()-interval '21 hours' WHERE id=$1`, id); err != nil {
++		t.Fatal(err)
++	}
++	step()
++	stage("inspect")
++	evidence.Store("unknown")
++	step()
++	stage("inspect")
++	evidence.Store("open")
++	step()
++	stage("reversal_review")
++	decision := dakimTestFields{"id": id, "evidence": "Eggs physically present in marked hold bin"}
++	finance.command("commerce.card.reversalApprove", decision, "", 409)
++	owner.command("commerce.card.reversalCustody", decision, "", 200)
++	owner.command("commerce.card.reversalApprove", decision, "", 403)
++	finance.command("commerce.card.reversalApprove", decision, "", 200)
++	step()
++	stage("reversal_finance")
++	evidence.Store("full")
++	finance.command("commerce.card.reversalApprove", decision, "", 200)
++	step()
++	stage("externally_refunded")
++	var legs int
++	var gross int64
++	if err := db.QueryRow(ctx, `SELECT count(*),sum(gross_minor) FROM external_card_reversal_leg WHERE attempt_id=$1 AND charge_ref='ch_test-sale'`, id).Scan(&legs, &gross); err != nil || legs != 3 || gross != 0 || creates.Load() != 1 {
++		t.Fatal(legs, gross, creates.Load(), err)
++	}
++}
++
++func TestDakimRejectsDuplicateFinancialEvidence(t *testing.T) {
++	job := CardJob{ID: "order", Kind: "charge", Remote: "dp_sale", Amount: 360, Currency: "USD", Digits: 2, Merchant: "mimi", Provider: "dakim-simulator", Reader: "MIMI-01"}
++	wire, err := json.Marshal(testDakimReversal(job.ID, 100, 260))
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, tc := range []struct{ name, field, replacement string }{
++		{"dispute status", `"dispute_status":"none"`, `"dispute_status":"open","dispute_status":"none"`},
++		{"dispute key alias", `"dispute_status":"none"`, `"DISPUTE_STATUS":"unknown","dispute_status":"none"`},
++		{"refund amount", `"amount":100`, `"amount":1,"amount":100`},
++		{"refund amount alias", `"amount":100`, `"Amount":99,"amount":100`},
++		{"source payment reference", `"reference":"ch_test-sale"`, `"reference":"ch_other","reference":"ch_test-sale"`},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			bad := bytes.Replace(wire, []byte(tc.field), []byte(tc.replacement), 1)
++			if bytes.Equal(bad, wire) {
++				t.Fatal("fixture failed to insert duplicate")
++			}
++			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(bad) }))
++			defer api.Close()
++			d := DakimSimulator{base: api.URL, client: api.Client()}
++			if proof, err := d.FullReversal(context.Background(), job); err == nil || proof.Charge != "" || len(proof.Refunds) != 0 {
++				t.Fatal("ambiguous response authorized release", proof, err)
++			}
++		})
++	}
++}
+diff --git a/internal/server/provider_refunds.go b/internal/server/provider_refunds.go
+new file mode 100644
+index 0000000..dc6719a
+--- /dev/null
++++ b/internal/server/provider_refunds.go
+@@ -0,0 +1,224 @@
++package server
++
++import (
++	"context"
++	"errors"
++	"log"
++	"net/http"
++	"net/url"
++	"slices"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/jackc/pgx/v5"
++)
++
++type providerRefund struct {
++	Sequence        int64     `json:"sequence"`
++	ID              string    `json:"id"`
++	Kind            string    `json:"kind"`
++	Merchant        string    `json:"merchant_id"`
++	Payment         string    `json:"payment_id"`
++	Order           string    `json:"order_id"`
++	Charge          string    `json:"charge_reference"`
++	SourceOperation string    `json:"source_operation"`
++	Reference       string    `json:"reference"`
++	Amount          int64     `json:"amount"`
++	Currency        string    `json:"currency"`
++	OriginalPayout  string    `json:"original_payout"`
++	OriginalBank    string    `json:"original_bank"`
++	OriginalDeposit *int64    `json:"original_deposit_minor"`
++	Occurred        time.Time `json:"occurred_at"`
++	attempt         string
++}
++
++type refundPage struct {
++	Refunds []providerRefund `json:"adjustments"`
++	Next    *int64           `json:"next_cursor"`
++}
++
++type providerStatement struct {
++	Payout   string          `json:"payout"`
++	Bank     string          `json:"bank"`
++	Currency string          `json:"currency"`
++	Deposit  *int64          `json:"depositMinor"`
++	Lines    []statementLine `json:"lines"`
++}
++
++// Only independently observed, completed financial facts cross this read-only
++// boundary. Each connector maps its order identity to the original till attempt.
++type adjustmentReader interface {
++	RefundNotices(context.Context, int64) (refundPage, error)
++	PostedStatement(context.Context, string) (providerStatement, error)
++}
++
++func (d *DakimSimulator) RefundNotices(ctx context.Context, after int64) (refundPage, error) {
++	var page refundPage
++	err := d.call(ctx, http.MethodGet, "/v1/adjustments?limit=50&after="+strconv.FormatInt(after, 10), "", nil, &page)
++	for i := range page.Refunds {
++		n := &page.Refunds[i]
++		if n.Currency != "USD" || !strings.HasPrefix(n.ID, "dr_") || !strings.HasPrefix(n.Payment, "dp_") {
++			return refundPage{}, errors.New("unexpected dakim refund identity or currency")
++		}
++		if id, ok := strings.CutPrefix(n.Order, "MIMI-"); ok && uuidRE.MatchString(id) {
++			n.attempt = id
++		}
++	}
++	return page, err
++}
++
++func (d *DakimSimulator) PostedStatement(ctx context.Context, payout string) (providerStatement, error) {
++	var wire struct {
++		Payout, Bank, Currency string
++		Deposit                *int64 `json:"depositMinor"`
++		Lines                  []struct {
++			Reference, Original, Kind, Payout string
++			Gross                             *int64 `json:"grossMinor"`
++			Fee                               *int64 `json:"feeMinor"`
++		} `json:"lines"`
++	}
++	if !statementRef.MatchString(payout) {
++		return providerStatement{}, errors.New("invalid payout reference")
++	}
++	if err := d.call(ctx, http.MethodGet, "/v1/payouts/"+url.PathEscape(payout)+"/statement", "", nil, &wire); err != nil {
++		return providerStatement{}, err
++	}
++	statement := providerStatement{Payout: wire.Payout, Bank: wire.Bank, Currency: wire.Currency, Deposit: wire.Deposit}
++	if statement.Payout != payout || !statementRef.MatchString(statement.Bank) || statement.Currency != "USD" || statement.Deposit == nil || !moneyRange(*statement.Deposit) || len(wire.Lines) == 0 || len(wire.Lines) > 10000 {
++		return providerStatement{}, errors.New("incomplete bank-matched statement")
++	}
++	seen := map[string]bool{}
++	for _, row := range wire.Lines {
++		if row.Gross == nil || row.Fee == nil || seen[row.Reference] {
++			return providerStatement{}, errors.New("missing or repeated bank statement line")
++		}
++		line := statementLine{Reference: row.Reference, Kind: row.Kind, Original: row.Original, Payout: row.Payout, Gross: *row.Gross, Fee: *row.Fee}
++		if line.Kind == "" {
++			line.Kind = "transaction"
++		}
++		if !line.valid() {
++			return providerStatement{}, errors.New("invalid matched bank statement line")
++		}
++		seen[line.Reference] = true
++		statement.Lines = append(statement.Lines, line)
++	}
++	return statement, nil
++}
++
++func (c *CardService) collectProviderRefunds(ctx context.Context, source adjustmentReader) error {
++	var after int64
++	err := c.DB.QueryRow(ctx, "SELECT coalesce(max(sequence_no),0) FROM provider_refund_notice WHERE provider=$1 AND merchant=$2", c.Provider, c.Merchant).Scan(&after)
++	if err != nil {
++		return err
++	}
++	page, err := source.RefundNotices(ctx, after)
++	if err != nil {
++		return err
++	}
++	if page.Next == nil || page.Refunds == nil || len(page.Refunds) > 50 {
++		return errors.New("incomplete adjustment page")
++	}
++	cursor := after
++	for _, n := range page.Refunds {
++		if n.Sequence <= cursor || n.Kind != "provider_refund" || n.Merchant != c.Merchant || n.Amount <= 0 || !moneyRange(n.Amount) ||
++			len(n.Currency) != 3 || n.Occurred.IsZero() || !statementRef.MatchString(n.ID) || !statementRef.MatchString(n.Payment) ||
++			!statementRef.MatchString(n.Order) || !statementRef.MatchString(n.Charge) || !statementRef.MatchString(n.SourceOperation) ||
++			!statementRef.MatchString(n.Reference) || !statementRef.MatchString(n.OriginalPayout) || !statementRef.MatchString(n.OriginalBank) || n.OriginalDeposit == nil || !moneyRange(*n.OriginalDeposit) {
++			return errors.New("inconsistent provider refund evidence")
++		}
++		cursor = n.Sequence
++	}
++	if *page.Next != cursor {
++		return errors.New("adjustment cursor did not match returned observations")
++	}
++	if len(page.Refunds) == 0 {
++		return nil
++	}
++	return pgx.BeginFunc(ctx, c.DB, func(tx pgx.Tx) error {
++		if _, err := tx.Exec(ctx, writerLock); err != nil {
++			return err
++		}
++		for _, n := range page.Refunds {
++			args := []any{c.Provider, c.Merchant, n.Sequence, n.ID, n.Payment, n.Order, n.attempt, n.Charge, n.SourceOperation, n.Reference, n.Amount, n.Currency, n.OriginalPayout, n.OriginalBank, *n.OriginalDeposit, n.Occurred}
++			tag, err := tx.Exec(ctx, `INSERT INTO provider_refund_notice(provider,merchant,sequence_no,adjustment_id,payment_ref,order_ref,attempt_ref,charge_ref,source_operation,source_ref,amount_minor,currency,original_payout,original_bank,original_deposit_minor,occurred_at)
++			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) ON CONFLICT DO NOTHING`, args...)
++			if err != nil {
++				return err
++			}
++			if tag.RowsAffected() == 0 {
++				var same bool
++				err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT FROM provider_refund_notice WHERE (provider,merchant,sequence_no,adjustment_id,payment_ref,order_ref,attempt_ref,charge_ref,source_operation,source_ref,amount_minor,currency,original_payout,original_bank,original_deposit_minor,occurred_at)=($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16))`, args...).Scan(&same)
++				if err != nil {
++					return err
++				}
++				if !same {
++					return errors.New("conflicting provider refund identity")
++				}
++			}
++		}
++		return nil
++	})
++}
++
++func (c *CardService) checkProviderStatement(ctx context.Context, source adjustmentReader) error {
++	var batch string
++	var want providerStatement
++	var amount int64
++	err := c.DB.QueryRow(ctx, `WITH candidate AS (SELECT ch.batch_id FROM provider_statement_check ch JOIN settlement_batch b ON b.id=ch.batch_id
++		WHERE b.provider=$1 AND b.merchant=$2 AND b.status='open' AND ch.verified_at IS NULL AND ch.next_check<=now()
++		ORDER BY ch.next_check,ch.batch_id LIMIT 1 FOR UPDATE OF ch SKIP LOCKED)
++		UPDATE provider_statement_check ch SET next_check=now()+interval '10 seconds' FROM candidate x,settlement_batch b
++		WHERE ch.batch_id=x.batch_id AND b.id=x.batch_id RETURNING b.id,b.payout_ref,b.bank_ref,b.currency,b.deposit_minor`, c.Provider, c.Merchant).Scan(&batch, &want.Payout, &want.Bank, &want.Currency, &amount)
++	if errors.Is(err, pgx.ErrNoRows) {
++		return nil
++	}
++	if err != nil {
++		return err
++	}
++	rows, err := c.DB.Query(ctx, `SELECT remote_id,gross_minor,fee_minor,entry_kind,original_ref,payout_ref FROM settlement_line WHERE batch_id=$1 ORDER BY remote_id`, batch)
++	if err != nil {
++		return err
++	}
++	want.Lines, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (statementLine, error) {
++		var l statementLine
++		e := r.Scan(&l.Reference, &l.Gross, &l.Fee, &l.Kind, &l.Original, &l.Payout)
++		return l, e
++	})
++	if err != nil {
++		return err
++	}
++	got, err := source.PostedStatement(ctx, want.Payout)
++	ok := false
++	message := "Awaiting verified bank statement"
++	if err == nil {
++		slices.SortFunc(got.Lines, func(a, b statementLine) int { return strings.Compare(a.Reference, b.Reference) })
++		ok = got.Deposit != nil && *got.Deposit == amount && got.Bank == want.Bank && got.Currency == want.Currency && got.Payout == want.Payout && slices.Equal(got.Lines, want.Lines)
++		if ok {
++			message = "Verified posted bank statement"
++		} else {
++			message = "Bank statement differs from the imported terms"
++		}
++	}
++	_, err = c.DB.Exec(ctx, `UPDATE provider_statement_check ch SET verified_at=CASE WHEN $2 THEN now() END,last_message=$3
++	FROM settlement_batch b WHERE ch.batch_id=$1 AND b.id=ch.batch_id AND b.status='open' AND ch.verified_at IS NULL`, batch, ok, message)
++	return err
++}
++
++func (c *CardService) monitorProviderRefunds(ctx context.Context, source adjustmentReader) {
++	ticker := time.NewTicker(2 * time.Second)
++	defer ticker.Stop()
++	for ctx.Err() == nil {
++		if err := c.collectProviderRefunds(ctx, source); err != nil && ctx.Err() == nil {
++			log.Printf("provider adjustment collection: %v", err)
++		}
++		if err := c.checkProviderStatement(ctx, source); err != nil && ctx.Err() == nil {
++			log.Printf("provider statement inspection: %v", err)
++		}
++		select {
++		case <-ctx.Done():
++			return
++		case <-ticker.C:
++		}
++	}
++}
+diff --git a/internal/server/provider_refunds_test.go b/internal/server/provider_refunds_test.go
+new file mode 100644
+index 0000000..968be53
+--- /dev/null
++++ b/internal/server/provider_refunds_test.go
+@@ -0,0 +1,185 @@
++package server
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"sync"
++	"testing"
++	"time"
++)
++
++// Exercise a second, independent provider adapter. Only its bank-matched
++// statement can prove the subsequent debit, even when the import looks valid.
++type adjustmentFixture struct {
++	Terminal
++	notice    providerRefund
++	statement providerStatement
++	posted    bool
++}
++
++func (f *adjustmentFixture) RefundNotices(_ context.Context, after int64) (refundPage, error) {
++	page := refundPage{Refunds: []providerRefund{}, Next: &after}
++	if f.notice.Sequence > after {
++		page.Refunds = append(page.Refunds, f.notice)
++		after = f.notice.Sequence
++	}
++	return page, nil
++}
++func (f *adjustmentFixture) PostedStatement(_ context.Context, id string) (providerStatement, error) {
++	if !f.posted || f.statement.Payout != id {
++		return providerStatement{}, errors.New("bank has not posted")
++	}
++	return f.statement, nil
++}
++
++func TestProviderRefundRequiresOriginalReceiptAndLaterPostedDebit(t *testing.T) {
++	type fields = map[string]any
++	ctx := context.Background()
++	db, cards, users, _ := officeHTTPStore(t, TrainingProfile())
++	cash, fin, review := users["cashier"], users["finance"], users["owner-a"]
++	fixture := &adjustmentFixture{Terminal: cards.Adapter}
++	cards.Adapter = fixture
++	basket := func() fields {
++		return cash.request("GET", "/api/state?view=register", nil, "", 200)["commerce"].(fields)["basket"].(fields)
++	}
++	cash.command("commerce.open", fields{}, "", 200)
++	b := basket()
++	cash.command("commerce.add", fields{"basketId": b["id"], "version": b["version"], "code": "EGGS"}, "", 200)
++	b = basket()
++	id := cash.command("commerce.card.start", fields{"basketId": b["id"], "version": b["version"], "expectedTotalMinor": 360, "quoteKey": b["quoteKey"]}, "", 200)["id"].(string)
++	for range 3 {
++		if _, e := db.Exec(ctx, "UPDATE card_attempt SET next_check=now() WHERE id=$1", id); e != nil {
++			t.Fatal(e)
++		}
++		if did, e := cards.Step(ctx); e != nil || !did {
++			t.Fatal(did, e)
++		}
++	}
++	var remote, receipt string
++	if e := db.QueryRow(ctx, "SELECT remote_id,receipt_id FROM card_attempt WHERE id=$1 AND status='succeeded'", id).Scan(&remote, &receipt); e != nil {
++		t.Fatal(e)
++	}
++	open := func(payout, bank string, deposit int, lines ...statementLine) string {
++		t.Helper()
++		return fin.command("finance.settlement.import", fields{"payout": payout, "bank": bank, "currency": "USD", "depositMinor": deposit, "lines": lines}, "", 200)["id"].(string)
++	}
++	close := func(id string, expect int) {
++		t.Helper()
++		review.command("finance.settlement.close", fields{"id": id}, "", expect)
++	}
++	void := func(id string) {
++		t.Helper()
++		review.command("finance.settlement.void", fields{"id": id, "reason": "Incorrect candidate statement"}, "", 200)
++	}
++	first := open("first", "bank-first", 353, statementLine{Reference: remote, Gross: 360, Fee: 7})
++	close(first, 200)
++	originalNet := int64(353)
++	fixture.notice = providerRefund{Sequence: 1, Kind: "provider_refund", ID: "dr_external", Payment: remote, Order: "merchant-receipt", attempt: id, Merchant: cards.Merchant, Charge: "origin_charge", SourceOperation: "provider_operation", Reference: "refund_ref", Amount: 120, Currency: "USD", OriginalPayout: "first", OriginalBank: "bank-first", OriginalDeposit: &originalNet, Occurred: time.Now().UTC()}
++	var workers sync.WaitGroup
++	for range 4 {
++		workers.Add(1)
++		go func() {
++			defer workers.Done()
++			if e := cards.collectProviderRefunds(ctx, fixture); e != nil {
++				t.Error(e)
++			}
++		}()
++	}
++	workers.Wait()
++	count := func(expected int, query string, args ...any) {
++		t.Helper()
++		var v int
++		if e := db.QueryRow(ctx, query, args...).Scan(&v); e != nil || v != expected {
++			t.Fatalf("%s got %d expected %d: %v", query, v, expected, e)
++		}
++	}
++	count(1, "SELECT count(*) FROM provider_refund_case WHERE receipt_id=$1 AND original_batch_id=$2 AND debit_batch_id IS NULL", receipt, first)
++
++	fixture.notice.Sequence = 2
++	fixture.notice.Amount++
++	if err := cards.collectProviderRefunds(ctx, fixture); err == nil {
++		t.Fatal("same provider adjustment was accepted with different money")
++	}
++	fixture.notice.Sequence = 1
++	fixture.notice.Amount--
++	count(1, "SELECT count(*) FROM provider_refund_notice")
++
++	leg := statementLine{Reference: "dr_external", Original: remote, Kind: "provider_refund", Gross: -120}
++	bad := leg
++	bad.Kind = "chargeback"
++	disguised := open("incorrect", "bank-wrong", -120, bad)
++	close(disguised, 409)
++	void(disguised)
++	fake := open("later", "some-other-bank", -120, leg)
++	amount := int64(-120)
++	fixture.statement = providerStatement{Payout: "later", Bank: "bank-later", Currency: "USD", Deposit: &amount, Lines: []statementLine{leg}}
++	fixture.posted = true
++	if e := cards.checkProviderStatement(ctx, fixture); e != nil {
++		t.Fatal(e)
++	}
++	close(fake, 409)
++	void(fake)
++	fixture.posted = false
++	debit := open("later", "bank-later", -120, leg)
++	if e := cards.checkProviderStatement(ctx, fixture); e != nil {
++		t.Fatal(e)
++	}
++	close(debit, 409)
++	count(0, "SELECT count(*) FROM provider_refund_applied")
++	count(0, "SELECT count(*) FROM settlement_journal WHERE batch_id=$1", debit)
++	fixture.posted = true
++	if _, e := db.Exec(ctx, "UPDATE provider_statement_check SET next_check=now() WHERE batch_id=$1", debit); e != nil {
++		t.Fatal(e)
++	}
++	if e := cards.checkProviderStatement(ctx, fixture); e != nil {
++		t.Fatal(e)
++	}
++	if _, err := db.Exec(ctx, "INSERT INTO settlement_line(batch_id,remote_id,gross_minor,fee_minor) VALUES($1,'additional',1,0)", debit); err == nil {
++		t.Fatal("additional line accepted after bank evidence")
++	}
++	if _, err := db.Exec(ctx, "UPDATE settlement_batch SET bank_ref='different-bank' WHERE id=$1", debit); err == nil {
++		t.Fatal("verified bank trace was mutable")
++	}
++	fin.command("finance.settlement.close", fields{"id": debit}, "", 403)
++	retrySameCommand(t, review, "finance.settlement.close", fields{"id": debit}, newOfficeKey())
++	close(debit, 409)
++	if e := cards.collectProviderRefunds(ctx, fixture); e != nil {
++		t.Fatal(e)
++	}
++	count(1, "SELECT count(*) FROM provider_refund_notice")
++	count(1, "SELECT count(*) FROM provider_refund_case WHERE debit_batch_id=$1 AND receipt_id=$2", debit, receipt)
++	count(-120, "SELECT amount_minor FROM settlement_journal WHERE account='bank' AND batch_id=$1", debit)
++	count(120, "SELECT amount_minor FROM settlement_journal WHERE account='provider_refund_suspense' AND batch_id=$1", debit)
++	count(353, "SELECT amount_minor FROM settlement_journal WHERE account='bank' AND batch_id=$1", first)
++	count(1, "SELECT count(*) FROM register_receipt")
++	count(0, "SELECT count(*) FROM register_refund")
++	count(0, "SELECT count(*) FROM settlement_journal s WHERE s.batch_id=$1 AND s.account NOT IN ('bank','provider_refund_suspense')", debit)
++	// An actual later retail return must respect the original card balance.
++	// The clerk can record a request, but $3.60 can no longer be refunded.
++	request := cash.command("commerce.refundRequest", fields{"receiptId": receipt, "sku": "EGGS", "qtyMilli": 1000, "reason": "Original goods brought back after provider refund"}, "", 200)["id"]
++	review.command("commerce.refundApprove", fields{"refundId": request}, "", 409)
++	count(0, "SELECT count(*) FROM card_attempt WHERE kind='refund'")
++	count(1, "SELECT count(*) FROM provider_refund_applied")
++
++}
++
++func TestDakimExternallyDeclinedOriginalRefund(t *testing.T) {
++	job := CardJob{Kind: "refund", ID: "request", Remote: "dr_refund", Original: "dp_charge", Provider: "dakim-simulator", Merchant: "mimi", Currency: "USD", Digits: 2, Amount: 120, Reader: "MIMI-01"}
++	for _, tc := range []struct{ reference, want string }{{`,"reference":""`, "declined"}, {"", "unknown"}, {`,"reference":null`, "unknown"}, {`,"reference":"rf_paid"`, "unknown"}} {
++		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			if r.Method != "GET" || r.URL.Path != "/v1/refunds/dr_refund" {
++				t.Error("unexpected refund instruction")
++			}
++			fmt.Fprintf(w, `{"id":"dr_refund","amount":120,"currency":"USD","merchant_id":"mimi","payment_id":"dp_charge","merchant_operation":"request","status":"declined"%s}`, tc.reference)
++		}))
++		d := DakimSimulator{base: s.URL, client: s.Client()}
++		fact, err := d.OriginalReference(context.Background(), job)
++		s.Close()
++		if err != nil || fact.State != tc.want {
++			t.Fatal(tc, fact, err)
++		}
++	}
++}

@@ -49,11 +49,17 @@ func AcquirerWithKeys(ctx context.Context, pool *pgxpool.Pool, publicURL, bankUR
 	mux.HandleFunc("GET /sim/health", health(pool))
 	mux.HandleFunc("POST /sim/charges", require(serviceToken, a.createCharge))
 	mux.HandleFunc("GET /sim/charges/{operation}", require(serviceToken, a.getCharge))
+	mux.HandleFunc("GET /sim/charges/{operation}/reversal-evidence", require(serviceToken, a.reversalEvidence))
 	mux.HandleFunc("POST /sim/approve/{operation}", require(approveToken, a.simulateApproval))
 	mux.HandleFunc("GET /checkout/{capability}", a.checkout)
 	mux.HandleFunc("POST /checkout/{capability}", a.checkout)
 	mux.HandleFunc("POST /sim/refunds", require(serviceToken, a.createRefund))
+	mux.HandleFunc("GET /sim/refunds/{operation}", require(serviceToken, a.getRefund))
+	mux.HandleFunc("GET /sim/source-refunds/{operation}", require(serviceToken, a.getSourceRefund))
+	mux.HandleFunc("GET /sim/source-refunds/by-reference/{reference}", require(serviceToken, a.getSourceRefund))
 	mux.HandleFunc("POST /sim/payouts", require(serviceToken, a.settle))
+	mux.HandleFunc("GET /sim/payouts/{operation}/fee-evidence", require(serviceToken, a.feeEvidence))
+	mux.HandleFunc("GET /sim/settlement-timing", require(serviceToken, settlementTiming[payoutTimingRecord](pool, payoutTimingQuery)))
 	return headers(mux), nil
 }
 
@@ -70,26 +76,32 @@ type chargeRequest struct {
 }
 
 type charge struct {
-	Operation   string `json:"operation_id"`
-	Reference   string `json:"reference"`
-	Status      string `json:"status"`
-	Merchant    string `json:"merchant_id"`
-	Order       string `json:"order_id"`
-	Channel     string `json:"channel"`
-	Amount      int64  `json:"amount"`
-	Currency    string `json:"currency"`
-	Brand       string `json:"brand"`
-	Terminal    string `json:"terminal_id"`
-	CheckoutURL string `json:"checkout_url"`
+	Operation         string `json:"operation_id"`
+	Reference         string `json:"reference"`
+	Status            string `json:"status"`
+	Merchant          string `json:"merchant_id"`
+	Order             string `json:"order_id"`
+	Channel           string `json:"channel"`
+	Amount            int64  `json:"amount"`
+	Currency          string `json:"currency"`
+	Brand             string `json:"brand"`
+	Terminal          string `json:"terminal_id"`
+	CheckoutURL       string `json:"checkout_url"`
+	CheckoutExpiresAt string `json:"checkout_expires_at,omitempty"`
+	DisputeStatus     string `json:"-"`
 }
 
-const chargeFields = "operation_id,reference,status,merchant_id,order_id,channel,amount,currency,brand,terminal_id,coalesce(checkout_token,'')"
+const chargeFields = "operation_id,reference,status,merchant_id,order_id,channel,amount,currency,brand,terminal_id,coalesce(checkout_token,''),dispute_status,checkout_expires_at"
 
 func (a *acquirer) readCharge(row pgx.Row) (charge, error) {
 	var c charge
 	var cap string
-	err := row.Scan(&c.Operation, &c.Reference, &c.Status, &c.Merchant, &c.Order, &c.Channel, &c.Amount, &c.Currency, &c.Brand, &c.Terminal, &cap)
-	if cap != "" {
+	var expires *time.Time
+	err := row.Scan(&c.Operation, &c.Reference, &c.Status, &c.Merchant, &c.Order, &c.Channel, &c.Amount, &c.Currency, &c.Brand, &c.Terminal, &cap, &c.DisputeStatus, &expires)
+	if expires != nil {
+		c.CheckoutExpiresAt = expires.UTC().Format(time.RFC3339Nano)
+	}
+	if cap != "" && c.Status != "expired" {
 		c.CheckoutURL = a.publicURL + "/checkout/" + cap
 	}
 	return c, err
@@ -135,8 +147,16 @@ func recordCapture(ctx context.Context, tx pgx.Tx, c charge) error {
 		rate = 250
 	}
 	fee := (c.Amount*rate + 5000) / 10000
-	_, err := tx.Exec(ctx, `insert into sim_line(kind,reference,amount,batch) values('capture',$1,$2,$3),('fee',$1,$4,$3)`, c.Reference, c.Amount, batchFor(c.Order), -fee)
-	return err
+	_, err := tx.Exec(ctx, `INSERT INTO sim_fee_estimate(payment_id,reference,merchant_id,amount,currency,fee,rate_bps,policy)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,'sim-card-fees-v1')`, c.Operation, c.Reference, c.Merchant, c.Amount, c.Currency, fee, rate)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `insert into sim_line(kind,reference,amount,batch) values('capture',$1,$2,$3),('fee',$1,$4,$3)`, c.Reference, c.Amount, batchFor(c.Order), -fee)
+	if err != nil {
+		return err
+	}
+	return enqueueCallback(ctx, tx, c.Merchant, c.Operation, "payment.captured")
 }
 
 func (a *acquirer) createCharge(w http.ResponseWriter, r *http.Request) {
@@ -158,8 +178,8 @@ func (a *acquirer) createCharge(w http.ResponseWriter, r *http.Request) {
 			if !req.matches(prior) {
 				return conflict("Order or operation already bound to another request")
 			}
-			c = prior
-			return nil
+			c, err = a.decideCheckout(ctx, tx, prior, false)
+			return err
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
@@ -174,8 +194,9 @@ func (a *acquirer) createCharge(w http.ResponseWriter, r *http.Request) {
 			cap = &key
 			status = "awaiting_customer"
 		}
-		c, err = a.readCharge(tx.QueryRow(ctx, `insert into sim_charge(operation_id,merchant_id,order_id,channel,amount,currency,brand,terminal_id,status,checkout_token,captured_at)
-			values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,case when $9='captured' then now() end) returning `+chargeFields, req.Operation, req.Merchant, req.Order, req.Channel, req.Amount, req.Currency, req.Brand, req.Terminal, status, cap))
+		c, err = a.readCharge(tx.QueryRow(ctx, `insert into sim_charge(operation_id,merchant_id,order_id,channel,amount,currency,brand,terminal_id,status,checkout_token,captured_at,dispute_status,checkout_expires_at)
+			values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,case when $9='captured' then now() end,'none',
+			case when $9='awaiting_customer' then clock_timestamp()+interval '15 minutes' end) returning `+chargeFields, req.Operation, req.Merchant, req.Order, req.Channel, req.Amount, req.Currency, req.Brand, req.Terminal, status, cap))
 		if err != nil {
 			return err
 		}
@@ -183,7 +204,7 @@ func (a *acquirer) createCharge(w http.ResponseWriter, r *http.Request) {
 			dropped = req.LoseResponse
 			return recordCapture(ctx, tx, c)
 		}
-		return nil
+		return enqueueCallback(ctx, tx, c.Merchant, c.Operation, "payment.awaiting_customer")
 	})
 	if err != nil {
 		respondError(w, err)
@@ -198,7 +219,7 @@ func (a *acquirer) createCharge(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *acquirer) getCharge(w http.ResponseWriter, r *http.Request) {
-	c, err := a.readCharge(a.pool.QueryRow(r.Context(), "select "+chargeFields+" from sim_charge where operation_id=$1", r.PathValue("operation")))
+	c, err := a.lookupCharge(r.Context(), r.PathValue("operation"), "", false)
 	if err != nil {
 		respondError(w, err)
 		return
@@ -206,30 +227,57 @@ func (a *acquirer) getCharge(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, 200, c)
 }
 
-func (a *acquirer) approve(ctx context.Context, op, cap string) (charge, error) {
-	var c charge
-	err := write(ctx, a.pool, func(tx pgx.Tx) error {
-		var err error
-		c, err = a.readCharge(tx.QueryRow(ctx, "select "+chargeFields+" from sim_charge where (operation_id=$1 or checkout_token=$2) and channel='online'", op, cap))
-		if err != nil {
-			return err
+// Captured and expired source records are terminal. Only an awaiting checkout
+// needs the financial write lock to resolve a possible approval/expiry race.
+func (a *acquirer) lookupCharge(ctx context.Context, op, cap string, approve bool) (charge, error) {
+	const lookup = "select " + chargeFields + " from sim_charge where (operation_id=$1 or checkout_token=$2) and (not $3 or channel='online')"
+	c, err := a.readCharge(a.pool.QueryRow(ctx, lookup, op, cap, approve))
+	if err != nil || c.Status != "awaiting_customer" {
+		return c, err
+	}
+	err = write(ctx, a.pool, func(tx pgx.Tx) error {
+		c, err = a.readCharge(tx.QueryRow(ctx, lookup, op, cap, approve))
+		if err == nil {
+			c, err = a.decideCheckout(ctx, tx, c, approve)
 		}
-		if c.Status == "captured" {
-			return nil
-		}
-		_, err = tx.Exec(ctx, "update sim_charge set status='captured',captured_at=now() where operation_id=$1", c.Operation)
-		if err != nil {
-			return err
-		}
-		c.Status = "captured"
-		return recordCapture(ctx, tx, c)
+		return err
 	})
 	return c, err
 }
+
+// Sample the provider's database clock once, after acquiring the financial
+// write lock. A request queued before the deadline cannot capture after it.
+func (a *acquirer) decideCheckout(ctx context.Context, tx pgx.Tx, c charge, approve bool) (charge, error) {
+	if c.Status != "awaiting_customer" {
+		return c, nil
+	}
+	next, err := a.readCharge(tx.QueryRow(ctx, `with decision as materialized (select clock_timestamp() as instant)
+		update sim_charge set status=case when checkout_expires_at<=instant then 'expired' else 'captured' end,
+		captured_at=case when checkout_expires_at>instant then instant end
+		from decision where operation_id=$1 and status='awaiting_customer' and ($2 or checkout_expires_at<=instant)
+		returning `+chargeFields, c.Operation, approve))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return c, nil
+	}
+	if err != nil {
+		return charge{}, err
+	}
+	if next.Status == "expired" {
+		err = enqueueCallback(ctx, tx, next.Merchant, next.Operation, "payment.expired")
+	} else {
+		err = recordCapture(ctx, tx, next)
+	}
+	return next, err
+}
+
 func (a *acquirer) simulateApproval(w http.ResponseWriter, r *http.Request) {
-	c, err := a.approve(r.Context(), r.PathValue("operation"), "")
+	c, err := a.lookupCharge(r.Context(), r.PathValue("operation"), "", true)
 	if err != nil {
 		respondError(w, err)
+		return
+	}
+	if c.Status == "expired" {
+		jsonResponse(w, http.StatusConflict, c)
 		return
 	}
 	jsonResponse(w, 200, c)

@@ -24,22 +24,27 @@ type Payment struct {
 	ID         string `json:"id"`
 	MerchantID string `json:"merchant_id"`
 	PaymentInput
-	Status      string    `json:"status"`
-	Reference   string    `json:"reference"`
-	CheckoutURL string    `json:"checkout_url"`
-	Refunded    int64     `json:"refunded"`
-	CreatedAt   time.Time `json:"created_at"`
+	Status                 string    `json:"status"`
+	Reference              string    `json:"reference"`
+	CheckoutURL            string    `json:"checkout_url"`
+	Refunded               int64     `json:"refunded"`
+	RefundReserved         int64     `json:"refund_reserved"`
+	RefundPendingRequested int64     `json:"refund_pending_requested"`
+	Refundable             int64     `json:"refundable"`
+	RefundBalanceReview    bool      `json:"refund_balance_review"`
+	CreatedAt              time.Time `json:"created_at"`
 }
 
-const paymentColumns = `p.id,p.merchant_id,p.order_id,p.channel,p.amount,p.currency,p.brand,p.terminal_id,p.lose_response,p.status,coalesce(p.reference,''),p.checkout_url,coalesce((select sum(r.amount) from pay.refunds r where r.payment_id=p.id and r.status='succeeded'),0),p.created_at`
+const paymentColumns = `p.id,p.merchant_id,p.order_id,p.channel,p.amount,p.currency,p.brand,p.terminal_id,p.lose_response,p.status,coalesce(p.reference,''),p.checkout_url,b.succeeded,b.reserved,b.pending_requested,b.available,b.review,p.created_at`
+const paymentSelect = `SELECT ` + paymentColumns + ` FROM pay.payments p JOIN pay.refund_balances b ON b.payment_id=p.id`
 
 func readPayment(row pgx.Row) (Payment, error) {
 	var p Payment
-	err := row.Scan(&p.ID, &p.MerchantID, &p.OrderID, &p.Channel, &p.Amount, &p.Currency, &p.Brand, &p.TerminalID, &p.LoseResponse, &p.Status, &p.Reference, &p.CheckoutURL, &p.Refunded, &p.CreatedAt)
+	err := row.Scan(&p.ID, &p.MerchantID, &p.OrderID, &p.Channel, &p.Amount, &p.Currency, &p.Brand, &p.TerminalID, &p.LoseResponse, &p.Status, &p.Reference, &p.CheckoutURL, &p.Refunded, &p.RefundReserved, &p.RefundPendingRequested, &p.Refundable, &p.RefundBalanceReview, &p.CreatedAt)
 	return p, err
 }
 func payment(ctx context.Context, q sqlDB, id string) (Payment, error) {
-	return readPayment(q.QueryRow(ctx, "SELECT "+paymentColumns+" FROM pay.payments p WHERE p.id=$1 AND p.merchant_id='mimi'", id))
+	return readPayment(q.QueryRow(ctx, paymentSelect+" WHERE p.id=$1 AND p.merchant_id='mimi'", id))
 }
 func (in PaymentInput) validate() error {
 	if !identifier.MatchString(in.OrderID) || in.Currency != "USD" || in.Amount < 1 || in.Amount > 100000000 {
@@ -87,7 +92,7 @@ func (s *Service) createPayment(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		old, err := readPayment(tx.QueryRow(ctx, "SELECT "+paymentColumns+" FROM pay.payments p WHERE p.merchant_id='mimi' AND p.request_key=$1", k))
+		old, err := readPayment(tx.QueryRow(ctx, paymentSelect+" WHERE p.merchant_id='mimi' AND p.request_key=$1", k))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return fail(409, "This merchant order already has a payment. Inspect its original operation.")
 		}
@@ -115,7 +120,7 @@ func (s *Service) createPayment(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	status := 201
-	if p.Status == "unknown" {
+	if p.Status == "unknown" || p.Status == "authorized" {
 		status = 202
 	}
 	answer(w, status, p)
@@ -134,7 +139,7 @@ func (s *Service) recover(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if p.Status != "captured" {
+	if !paymentFinal(p.Status) {
 		p, err = s.syncCharge(r.Context(), p, true)
 		if err != nil {
 			return err
@@ -145,17 +150,30 @@ func (s *Service) recover(w http.ResponseWriter, r *http.Request) error {
 }
 
 type chargeFact struct {
-	OperationID string `json:"operation_id"`
-	Reference   string `json:"reference"`
-	MerchantID  string `json:"merchant_id"`
-	Status      string `json:"status"`
-	OrderID     string `json:"order_id"`
-	Channel     string `json:"channel"`
-	Amount      int64  `json:"amount"`
-	Currency    string `json:"currency"`
-	Brand       string `json:"brand"`
-	TerminalID  string `json:"terminal_id"`
-	CheckoutURL string `json:"checkout_url"`
+	OperationID       string     `json:"operation_id"`
+	Reference         string     `json:"reference"`
+	MerchantID        string     `json:"merchant_id"`
+	Status            string     `json:"status"`
+	OrderID           string     `json:"order_id"`
+	Channel           string     `json:"channel"`
+	Amount            int64      `json:"amount"`
+	Currency          string     `json:"currency"`
+	Brand             string     `json:"brand"`
+	TerminalID        string     `json:"terminal_id"`
+	CheckoutURL       string     `json:"checkout_url"`
+	CheckoutExpiresAt *time.Time `json:"checkout_expires_at,omitempty"`
+}
+
+// An expired fact is the provider's final unpaid outcome for the original
+// operation. Passing the presentation deadline by itself cannot set this state.
+func paymentFinal(status string) bool {
+	return status == "captured" || status == "expired"
+}
+
+func (fact chargeFact) boundTo(p Payment) bool {
+	return fact.OperationID == p.ID && fact.MerchantID == p.MerchantID && fact.OrderID == p.OrderID &&
+		fact.Channel == p.Channel && fact.Amount == p.Amount && fact.Currency == p.Currency &&
+		fact.Brand == p.Brand && fact.TerminalID == p.TerminalID && identifier.MatchString(fact.Reference)
 }
 
 func (s *Service) syncCharge(ctx context.Context, p Payment, inspect bool) (Payment, error) {
@@ -165,7 +183,16 @@ func (s *Service) syncCharge(ctx context.Context, p Payment, inspect bool) (Paym
 	if inspect {
 		code, err = s.remote(ctx, s.acquirer, http.MethodGet, "/sim/charges/"+url.PathEscape(p.ID), nil, &fact)
 	}
-	if !inspect || code == 404 {
+	// A bound reference proves that the processor previously knew the operation.
+	// Re-read after a 404 because another worker may have verified a reference
+	// while this request was in flight. Only an unbound original can be resumed.
+	if inspect && code == http.StatusNotFound {
+		p, err = payment(ctx, s.db, p.ID)
+		if err != nil || p.Reference != "" || p.Status != "unknown" {
+			return p, err
+		}
+	}
+	if !inspect || code == http.StatusNotFound {
 		req := struct {
 			OperationID string `json:"operation_id"`
 			MerchantID  string `json:"merchant_id"`
@@ -183,10 +210,22 @@ func (s *Service) syncCharge(ctx context.Context, p Payment, inspect bool) (Paym
 		}
 		return payment(ctx, s.db, p.ID)
 	}
-	if fact.OperationID != p.ID || fact.MerchantID != p.MerchantID || fact.OrderID != p.OrderID || fact.Channel != p.Channel || fact.Amount != p.Amount || fact.Currency != p.Currency || fact.Brand != p.Brand || fact.TerminalID != p.TerminalID || !identifier.MatchString(fact.Reference) {
+	return s.acceptCharge(ctx, p, fact, inspect)
+}
+
+// Both command replies and read-only processor lookups pass through the same
+// merchant, financial terms and monotonic state checks.
+func (s *Service) acceptCharge(ctx context.Context, p Payment, fact chargeFact, inspect bool) (Payment, error) {
+	if !fact.boundTo(p) {
 		return p, fail(502, "Acquirer evidence differs from the original payment.")
 	}
-	if fact.Status != "captured" && (fact.Status != "awaiting_customer" || p.Channel != "online") {
+	switch fact.Status {
+	case "awaiting_customer", "expired":
+		if p.Channel != "online" {
+			return p, fail(502, "Acquirer checkout state refers to a terminal payment.")
+		}
+	case "authorized", "captured":
+	default:
 		return p, fail(502, "Unrecognized acquirer state.")
 	}
 	link := ""
@@ -214,11 +253,22 @@ func (s *Service) syncCharge(ctx context.Context, p Payment, inspect bool) (Paym
 	if ref != "" && ref != fact.Reference {
 		return p, fail(502, "Acquirer changed the original payment reference.")
 	}
-	if status != "captured" && (status != fact.Status || ref != fact.Reference || priorLink != link) {
+	if paymentFinal(status) && paymentFinal(fact.Status) && status != fact.Status {
+		return p, fail(502, "Acquirer reported conflicting final outcomes for the original payment. Review its capture and settlement evidence.")
+	}
+	// A stale checkout snapshot cannot reopen a closed checkout or release it again.
+	stale := paymentFinal(status) || (status == "authorized" && fact.Status == "awaiting_customer")
+	if !stale && (status != fact.Status || ref != fact.Reference || priorLink != link) {
 		if _, err = tx.Exec(ctx, "UPDATE pay.payments SET status=$2,reference=$3,checkout_url=$4 WHERE id=$1", p.ID, fact.Status, fact.Reference, link); err != nil {
 			return p, err
 		}
 		msg := "Partner-hosted checkout created; awaiting the customer."
+		if fact.Status == "expired" {
+			msg = "Acquirer confirmed the original checkout closed unpaid."
+		}
+		if fact.Status == "authorized" {
+			msg = "Original authorization verified. Awaiting capture before release or refund."
+		}
 		if fact.Status == "captured" {
 			msg = "Acquirer capture verified against order, merchant, currency and amount."
 		}

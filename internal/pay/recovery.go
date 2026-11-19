@@ -11,11 +11,21 @@ import (
 // RunRecovery follows original pending operations without relying on the shopper
 // returning to the merchant or the cashier's browser remaining open.
 func (s *Service) RunRecovery(ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runChecks(ctx, "processor callbacks", s.ProcessCallbacks)
+	}()
+	runChecks(ctx, "payment recovery", s.recoverDue)
+	<-done
+}
+
+func runChecks(ctx context.Context, label string, check func(context.Context) error) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for ctx.Err() == nil {
-		if err := s.recoverDue(ctx); err != nil && ctx.Err() == nil {
-			log.Printf("payment recovery: %v", err)
+		if err := check(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("%s: %v", label, err)
 		}
 		select {
 		case <-ctx.Done():
@@ -29,7 +39,7 @@ func (s *Service) RunRecovery(ctx context.Context) {
 // network I/O, so restarts and competing workers preserve the original operation.
 const claimRecovery = `
 WITH due_pay AS (
- SELECT id FROM pay.payments WHERE status IN ('unknown','awaiting_customer') AND next_recovery<=now()
+ SELECT id FROM pay.payments WHERE status IN ('unknown','awaiting_customer','authorized') AND next_recovery<=now()
  ORDER BY next_recovery,id LIMIT 1 FOR UPDATE SKIP LOCKED
 ), p AS (
  UPDATE pay.payments a SET recovery_attempts=least(a.recovery_attempts+1,6),
@@ -61,7 +71,7 @@ func (s *Service) recoverDue(ctx context.Context) error {
 			return err
 		}
 		if len(jobs) == 0 {
-			return nil
+			break
 		}
 		for _, j := range jobs {
 			if ctx.Err() != nil {
@@ -71,14 +81,14 @@ func (s *Service) recoverDue(ctx context.Context) error {
 			case "payment":
 				var p Payment
 				p, err = payment(ctx, s.db, j.id)
-				if err == nil && p.Status != "captured" {
+				if err == nil && !paymentFinal(p.Status) {
 					_, err = s.syncCharge(ctx, p, true)
 				}
 			case "refund":
 				var f Refund
 				f, err = refundByID(ctx, s.db, j.id)
 				if err == nil && f.Status != "succeeded" {
-					_, err = s.syncRefund(ctx, f)
+					_, err = s.syncRefund(ctx, f, true)
 				}
 			}
 			if err != nil && ctx.Err() == nil {
@@ -86,5 +96,5 @@ func (s *Service) recoverDue(ctx context.Context) error {
 			}
 		}
 	}
-	return nil
+	return s.recoverHeldRefunds(ctx)
 }

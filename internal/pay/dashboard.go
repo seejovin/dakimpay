@@ -22,13 +22,15 @@ type Totals struct {
 	PendingDeposit int64 `json:"pending_deposit"`
 }
 type Dashboard struct {
-	MerchantID string    `json:"merchant_id"`
-	Currency   string    `json:"currency"`
-	Payments   []Payment `json:"payments"`
-	Refunds    []Refund  `json:"refunds"`
-	Payouts    []Payout  `json:"payouts"`
-	Events     []Event   `json:"events"`
-	Totals     Totals    `json:"totals"`
+	MerchantID string          `json:"merchant_id"`
+	Currency   string          `json:"currency"`
+	Payments   []Payment       `json:"payments"`
+	Refunds    []Refund        `json:"refunds"`
+	Payouts    []Payout        `json:"payouts"`
+	FeeReports []feeReportLink `json:"fee_reports"`
+	Callbacks  []Callback      `json:"callbacks"`
+	Events     []Event         `json:"events"`
+	Totals     Totals          `json:"totals"`
 }
 
 func list[T any](ctx context.Context, db sqlDB, query string, scan func(pgx.Row) (T, error)) ([]T, error) {
@@ -46,7 +48,7 @@ func (s *Service) dashboard(w http.ResponseWriter, r *http.Request) error {
 	}
 	defer tx.Rollback(ctx)
 	d := Dashboard{MerchantID: "mimi", Currency: "USD"}
-	d.Payments, err = list(ctx, tx, "SELECT "+paymentColumns+" FROM pay.payments p WHERE p.merchant_id='mimi' ORDER BY created_at DESC,id DESC", readPayment)
+	d.Payments, err = list(ctx, tx, paymentSelect+" WHERE p.merchant_id='mimi' ORDER BY p.created_at DESC,p.id DESC", readPayment)
 	if err != nil {
 		return err
 	}
@@ -58,11 +60,19 @@ func (s *Service) dashboard(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	d.FeeReports, err = list(ctx, tx, feeReportsSelect+" ORDER BY p.created_at DESC NULLS FIRST,s.operation_id", readFeeReportLink)
+	if err != nil {
+		return err
+	}
 	d.Events, err = list(ctx, tx, "SELECT id,subject,kind,message,created_at FROM pay.events ORDER BY id DESC", func(row pgx.Row) (Event, error) {
 		var e Event
 		err := row.Scan(&e.ID, &e.Subject, &e.Kind, &e.Message, &e.CreatedAt)
 		return e, err
 	})
+	if err != nil {
+		return err
+	}
+	d.Callbacks, err = callbacks(ctx, tx)
 	if err != nil {
 		return err
 	}

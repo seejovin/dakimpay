@@ -16,6 +16,8 @@ cd dakimpay
 
 Open [dakim pay](http://127.0.0.1:8460) on the machine that runs it. Choose **Run payment journey**, then **View journey trace**. Replaying the journey reuses the original order, refund, payout and bank references. It remains separate from practice sales. Use `./scripts/local status`, `restart` or `stop` to manage the services. The launcher keeps its private keys, databases and logs outside the repository under `~/.local/share/dakim-pay`. An alternate `DAKIM_STATE_DIR` and distinct ports create a separate installation.
 
+The [recorded Mimi payment journey](docs/mimi-payment-journey.md) includes both charge references, the original refund, the payout and the independently observed bank posting.
+
 ## How payment emulation works
 
 | What happens | What the app actually checks |
@@ -32,12 +34,16 @@ The local fee schedule is deliberately simple. Terminal captures cost 2%, online
 
 ## Connecting the actual Mimi POS
 
-The dakim pay console can run by itself. A compatible Mimi checkout can also run as a separately installed merchant using its normal register, returns, finance and sign-in screens. The supplied patch targets Mimi revision `e3186a9`. Apply it only to a checkout that lacks the adapter.
+The dakim pay console can run by itself. A compatible Mimi checkout can also run as a separately installed merchant using its normal register, returns, finance and sign-in screens. The base adapter patch targets Mimi revision `e3186a9`. The finance patches add classification and independent correction review to that adapter. For a clean checkout use the sequence below. The adjacent development checkout already includes these changes.
 
 ```sh
 # From the dakim pay directory, with the Mimi source in ../mimi
 git -C ../mimi apply --check "$PWD/integrations/mimi-simulator.patch"
 git -C ../mimi apply "$PWD/integrations/mimi-simulator.patch"
+git -C ../mimi apply --check "$PWD/integrations/mimi-finance-reporting.patch"
+git -C ../mimi apply "$PWD/integrations/mimi-finance-reporting.patch"
+git -C ../mimi apply --check "$PWD/integrations/mimi-finance-corrections.patch"
+git -C ../mimi apply "$PWD/integrations/mimi-finance-corrections.patch"
 ../mimi/scripts/mimi-dakim start
 ```
 
@@ -55,11 +61,25 @@ The integration test buys two grocery items through the real Mimi register API a
 
 Each process owns a separate PostgreSQL database in a private local cluster. The launcher generates distinct merchant, service, bank-instruction, buyer-approval and bank-post credentials and a private console cookie. Merchant requests cannot operate the training bank or submit an operator payout. The local console also acts as a **simulation controller**, with separate credentials for the artificial buyer and bank operator. This is a single-user loopback installation. Local OS access is its operator trust boundary. A production deployment needs independent hosts/identities, merchant onboarding, staff authentication and authorization, partner security validation, real statements, backups and operating coverage. The simulator has no live mode.
 
+The simulated acquirer and dakim pay share a dedicated notification-signing key. **Activity → Processor notifications** shows whether dakim pay verified each original transaction and flags conflicting deliveries. A payment marked **Awaiting capture** stays on hold. [Recovery procedures, tested amounts and outstanding release gates](docs/callback-recovery-checkpoint.md)
+
+If a capture is refunded before Mimi issues the receipt, the register checks the original charge, every refund and the acquirer's dispute observation. Operations records custody and finance verifies the full amount before the carton goes to quarantine. The cross-application exercise follows the resulting seven-cent debit into Mimi's books. [Receiptless refund checkpoint](docs/receiptless-refund-checkpoint.md) · [Stripe, WeChat Pay and Alipay benchmarks](docs/provider-benchmarks.md)
+
+When the acquirer initiates a refund after Mimi has deposited the sale proceeds, finance receives a separate exception and reconciles the later debit. The original receipt and matched deposit stay intact. [Post-receipt refund checkpoint and run evidence](docs/post-receipt-refund-checkpoint.md)
+
+In Mimi **Reports → Provider refunds after sale**, finance can document a merchant-funded service concession on a matched later debit. A different reviewer can approve that version or return it with a reason. Finance can submit corrected evidence while preserving the original proposal and return decision. The reporting record links the receipt, original deposit and later debit. The bank and suspense journals retain their posted values. [Finance workflow](docs/finance-classification.md) · [Correction and replay evidence](docs/finance-corrections.md)
+
+Each captured payment shows the successful refunds, amount reserved for pending requests and amount still available. [Refund reservation rules, concurrency and upgrade evidence](docs/refund-reservations.md)
+
+Finance can compare the processor’s capture-time fee estimate with each fee on a frozen statement in **Deposits → Compare fees**, including when a payout is held for review. [Itemized fee comparison and verified bank example](docs/fee-variance.md)
+
+In **Deposits → Open timing queue**, finance can find processor payouts awaiting a bank posting, bank postings without a processor payout, and source matches. Record a complete observation to preserve when the report first learned each payout, bank posting and local booking. Replay with separate effective and knowledge cutoffs. [Timing queue](docs/settlement-timing.md) · [What finance knew at shift close](docs/settlement-knowledge.md)
+
 ## Verify it
 
 ```sh
 ./scripts/verify
-MIMI_SOURCE=../mimi ./scripts/verify-mimi
+MIMI_SOURCE=../mimi ./scripts/verify-mimi --settlement-regression
 ```
 
 The first script starts a disposable three-service installation, exercises the hosted checkout, restarts the services with an unresolved charge, checks replay and the partial refund, holds an unposted deposit, then matches the bank and merchant export. It also tests all six brand and channel combinations and guided replay. The second script requires the patched Mimi checkout and starts an additional disposable Mimi installation. Both scripts stop their processes and remove their own temporary data.

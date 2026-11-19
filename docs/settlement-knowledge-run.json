@@ -1,0 +1,74 @@
+{
+  "fixture": "Local temporary three-service installation, Chrome 142.0.7444.176, USD test data.",
+  "source_effective_cutoff": "2026-11-18T10:00:00Z",
+  "first_observation": "2026-11-19T14:48:49.887516Z",
+  "second_observation": "2026-11-19T14:48:50.142721Z",
+  "earlier_view": {
+    "known_as_of": "2026-11-19T14:48:49.887516Z",
+    "observed_at": "2026-11-19T14:48:49.887516Z",
+    "source_through": "2026-11-19T14:48:49.885268Z",
+    "merchant_id": "mimi",
+    "currency": "USD",
+    "as_of": "2026-11-18T10:00:00Z",
+    "open": [
+      {
+        "payout_known_at": "2026-11-19T14:48:49.887516Z",
+        "bank_known_at": null,
+        "booking_known_at": null,
+        "status": "in_transit",
+        "bank_trace": "bt_bakery",
+        "operation_id": "ds_bakery",
+        "payout_id": "po_bakery",
+        "currency": "USD",
+        "processor_amount": 4200,
+        "bank_amount": null,
+        "payout_at": "2026-11-18T09:00:00Z",
+        "posted_at": null,
+        "age_seconds": 3600,
+        "booked_match_at": null
+      }
+    ],
+    "matched": []
+  },
+  "later_view": {
+    "known_as_of": "2026-11-19T14:48:50.142721Z",
+    "observed_at": "2026-11-19T14:48:50.142721Z",
+    "source_through": "2026-11-19T14:48:50.141497Z",
+    "merchant_id": "mimi",
+    "currency": "USD",
+    "as_of": "2026-11-18T10:00:00Z",
+    "open": [],
+    "matched": [
+      {
+        "payout_known_at": "2026-11-19T14:48:49.887516Z",
+        "bank_known_at": "2026-11-19T14:48:50.142721Z",
+        "booking_known_at": null,
+        "status": "matched",
+        "bank_trace": "bt_bakery",
+        "operation_id": "ds_bakery",
+        "payout_id": "po_bakery",
+        "currency": "USD",
+        "processor_amount": 4200,
+        "bank_amount": 4200,
+        "payout_at": "2026-11-18T09:00:00Z",
+        "posted_at": "2026-11-18T08:30:00Z",
+        "age_seconds": 1800,
+        "booked_match_at": null
+      }
+    ]
+  },
+  "checks": {
+    "same_cutoff_replay_before_and_after_late_delivery": true,
+    "fixed_history_read_many_times": true,
+    "prehistory_indeterminate": true,
+    "source_before_and_after_preserved": true,
+    "unchanged_financial_tables_checked": 14,
+    "local_booked_payouts": 0,
+    "recorded_observations": 2,
+    "distinct_source_facts": 2,
+    "observation_posts": 2,
+    "history_gets": 9,
+    "browser_errors": [],
+    "small_viewport_width": 355
+  }
+}

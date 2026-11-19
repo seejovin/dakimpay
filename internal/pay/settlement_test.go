@@ -77,7 +77,20 @@ func TestRefundAfterRemittanceCreatesIndependentDebit(t *testing.T) {
 	if line["reference"] != ref["id"] || line["grossMinor"] != float64(-400) || line["feeMinor"] != float64(0) {
 		t.Fatal(line)
 	}
-	totals := call("GET", "/v1/dashboard", "", nil, 200)["totals"].(map[string]any)
+	dashboard := call("GET", "/v1/dashboard", "", nil, 200)
+	var operation string
+	for _, item := range dashboard["fee_reports"].([]any) {
+		link := item.(map[string]any)
+		if link["payout_id"] == debit["id"] {
+			operation = link["operation_id"].(string)
+		}
+	}
+	report := call("GET", "/v1/settlements/"+operation+"/fee-report", "", nil, 200)
+	if report["status"] != "no_fees" || report["bank_status"] != "matched" || report["bank_amount"] != float64(-400) ||
+		report["actual_total"] != float64(0) || report["expected_total"] != float64(0) || len(report["lines"].([]any)) != 0 {
+		t.Fatal("fee report for a refund-only bank debit", report)
+	}
+	totals := dashboard["totals"].(map[string]any)
 	if totals["deposited"] != float64(580) || totals["fees"] != float64(20) {
 		t.Fatal(totals)
 	}

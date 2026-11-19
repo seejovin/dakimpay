@@ -90,6 +90,11 @@ func (s *Service) settle(w http.ResponseWriter, r *http.Request) error {
 	if fact.MerchantID != "mimi" || fact.Currency != "USD" || !identifier.MatchString(fact.ID) || !identifier.MatchString(fact.BankTrace) || len(fact.Lines) == 0 {
 		return fail(502, "Invalid acquirer statement identity or currency.")
 	}
+	// The statement can arrive before its notification. Discover any unknown
+	// refund by source reference and verify it independently before matching.
+	if err = s.discoverStatementRefunds(ctx, fact.Lines); err != nil {
+		return err
+	}
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return err
@@ -150,6 +155,41 @@ func (s *Service) settle(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	answer(w, 201, p)
+	return nil
+}
+
+func (s *Service) discoverStatementRefunds(ctx context.Context, lines []Line) error {
+	var refs []string
+	for _, l := range lines {
+		if l.Kind == "refund" {
+			if !identifier.MatchString(l.Reference) {
+				return fail(502, "Invalid statement refund reference.")
+			}
+			refs = append(refs, l.Reference)
+		}
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+	rows, err := s.db.Query(ctx, `SELECT DISTINCT source_ref FROM unnest($1::text[]) AS input(source_ref)
+		WHERE NOT EXISTS(SELECT FROM pay.refunds r WHERE r.reference=input.source_ref AND r.status='succeeded')
+		ORDER BY source_ref`, refs)
+	if err != nil {
+		return err
+	}
+	missing, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	for _, reference := range missing {
+		status, detail, err := s.inspectSourceRefund(ctx, "", reference)
+		if err != nil {
+			return err
+		}
+		if status != "applied" {
+			return fail(409, detail)
+		}
+	}
 	return nil
 }
 func matchLine(ctx context.Context, tx pgx.Tx, l Line, batch string) error {
@@ -326,6 +366,8 @@ type merchantLine struct {
 	Reference string `json:"reference"`
 	Gross     int64  `json:"grossMinor"`
 	Fee       int64  `json:"feeMinor"`
+	Kind      string `json:"kind,omitempty"`
+	Original  string `json:"original,omitempty"`
 }
 
 func (s *Service) merchantStatement(w http.ResponseWriter, r *http.Request) error {
@@ -344,7 +386,9 @@ func (s *Service) merchantStatement(w http.ResponseWriter, r *http.Request) erro
 	}
 	rows, err := tx.Query(ctx, `SELECT coalesce(p.id,r.id) AS reference,
  sum(CASE WHEN l.kind='fee' THEN 0 ELSE l.amount END)::bigint AS gross,
- -sum(CASE WHEN l.kind='fee' THEN l.amount ELSE 0 END)::bigint AS fee
+ -sum(CASE WHEN l.kind='fee' THEN l.amount ELSE 0 END)::bigint AS fee,
+ coalesce(max(CASE WHEN r.source_operation IS NOT NULL THEN 'provider_refund' END),''),
+ coalesce(max(CASE WHEN r.source_operation IS NOT NULL THEN r.payment_id END),'')
  FROM pay.lines l LEFT JOIN pay.payments p ON p.merchant_id='mimi' AND l.kind IN ('capture','fee') AND p.reference=l.reference
  LEFT JOIN pay.refunds r ON l.kind='refund' AND r.reference=l.reference
  WHERE l.payout_id=$1 GROUP BY coalesce(p.id,r.id) ORDER BY coalesce(p.id,r.id)`, p.ID)
@@ -353,7 +397,7 @@ func (s *Service) merchantStatement(w http.ResponseWriter, r *http.Request) erro
 	}
 	lines, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (merchantLine, error) {
 		var l merchantLine
-		err := row.Scan(&l.Reference, &l.Gross, &l.Fee)
+		err := row.Scan(&l.Reference, &l.Gross, &l.Fee, &l.Kind, &l.Original)
 		return l, err
 	})
 	if err != nil {

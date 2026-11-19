@@ -1,0 +1,234 @@
+{
+  "fixture": "Disposable local processor, bank and dakim pay databases. Synthetic USD source records. Times are UTC.",
+  "browser": "Chrome 142.0.7444.176",
+  "cutoff_before": {
+    "merchant_id": "mimi",
+    "currency": "USD",
+    "as_of": "2026-11-18T18:00:00Z",
+    "open": [
+      {
+        "status": "in_transit",
+        "bank_trace": "bt_bakery",
+        "operation_id": "ds_bakery",
+        "payout_id": "po_bakery",
+        "currency": "USD",
+        "processor_amount": 4200,
+        "bank_amount": null,
+        "payout_at": "2026-11-18T08:30:00Z",
+        "posted_at": null,
+        "age_seconds": 34200,
+        "booked_match_at": null
+      },
+      {
+        "status": "bank_only",
+        "bank_trace": "bt_returns",
+        "operation_id": "",
+        "payout_id": "",
+        "currency": "USD",
+        "processor_amount": null,
+        "bank_amount": -1250,
+        "payout_at": null,
+        "posted_at": "2026-11-18T15:00:00Z",
+        "age_seconds": 10800,
+        "booked_match_at": null
+      }
+    ],
+    "matched": [
+      {
+        "status": "matched",
+        "bank_trace": "bt_pantry",
+        "operation_id": "ds_pantry",
+        "payout_id": "po_pantry",
+        "currency": "USD",
+        "processor_amount": 9800,
+        "bank_amount": 9800,
+        "payout_at": "2026-11-18T06:15:00Z",
+        "posted_at": "2026-11-18T07:45:00Z",
+        "age_seconds": 5400,
+        "booked_match_at": "2026-11-18T08:00:00Z"
+      }
+    ]
+  },
+  "cutoff_after": {
+    "merchant_id": "mimi",
+    "currency": "USD",
+    "as_of": "2026-11-18T20:00:00Z",
+    "open": [
+      {
+        "status": "bank_only",
+        "bank_trace": "bt_returns",
+        "operation_id": "",
+        "payout_id": "",
+        "currency": "USD",
+        "processor_amount": null,
+        "bank_amount": -1250,
+        "payout_at": null,
+        "posted_at": "2026-11-18T15:00:00Z",
+        "age_seconds": 18000,
+        "booked_match_at": null
+      }
+    ],
+    "matched": [
+      {
+        "status": "matched",
+        "bank_trace": "bt_bakery",
+        "operation_id": "ds_bakery",
+        "payout_id": "po_bakery",
+        "currency": "USD",
+        "processor_amount": 4200,
+        "bank_amount": 4200,
+        "payout_at": "2026-11-18T08:30:00Z",
+        "posted_at": "2026-11-18T19:15:00Z",
+        "age_seconds": 38700,
+        "booked_match_at": null
+      },
+      {
+        "status": "matched",
+        "bank_trace": "bt_pantry",
+        "operation_id": "ds_pantry",
+        "payout_id": "po_pantry",
+        "currency": "USD",
+        "processor_amount": 9800,
+        "bank_amount": 9800,
+        "payout_at": "2026-11-18T06:15:00Z",
+        "posted_at": "2026-11-18T07:45:00Z",
+        "age_seconds": 5400,
+        "booked_match_at": "2026-11-18T08:00:00Z"
+      }
+    ]
+  },
+  "fixed_early_cutoff_same_after_later_post": true,
+  "live_open_before": 2,
+  "live_open_after": 1,
+  "live_matched_before": 1,
+  "live_matched_after": 2,
+  "browser_queue_gets": 2,
+  "browser_financial_writes": 0,
+  "browser_errors": [],
+  "read_only_evidence": {
+    "tables_checked": 14,
+    "reads_before_append_unchanged": true,
+    "append_changed_only": [
+      "bank.sim_bank_entry"
+    ],
+    "prior_bank_rows_preserved": true,
+    "reads_after_append_unchanged": true,
+    "before": {
+      "pay.pay.payments": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "pay.pay.refunds": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "pay.pay.payouts": {
+        "rows": 1,
+        "sha256": "e21aef410826c343ae7dbb7e25680dafb3ff5124757129bfda5e2ffc19b5c177"
+      },
+      "pay.pay.lines": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "pay.pay.settlement_requests": {
+        "rows": 1,
+        "sha256": "7d172abfb27f5dc6b03ce244538667454cc20b3d76c205d85a3374a69876c462"
+      },
+      "pay.pay.settlement_expected": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "pay.pay.settlement_keys": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "acquirer.sim_charge": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "acquirer.sim_refund": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "acquirer.sim_refund_decline": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "acquirer.sim_payout": {
+        "rows": 2,
+        "sha256": "2ccdb0fec1ec3ef56c59f7aa87763a240fa13d74d722cbbfa745da9d41c01207"
+      },
+      "acquirer.sim_line": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "acquirer.sim_fee_estimate": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "bank.sim_bank_entry": {
+        "rows": 2,
+        "sha256": "24dd28b87d7eb5378bf2f2e66129e12bf3609d9b42b37836f470b1cdd536cb14"
+      }
+    },
+    "after": {
+      "pay.pay.payments": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "pay.pay.refunds": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "pay.pay.payouts": {
+        "rows": 1,
+        "sha256": "e21aef410826c343ae7dbb7e25680dafb3ff5124757129bfda5e2ffc19b5c177"
+      },
+      "pay.pay.lines": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "pay.pay.settlement_requests": {
+        "rows": 1,
+        "sha256": "7d172abfb27f5dc6b03ce244538667454cc20b3d76c205d85a3374a69876c462"
+      },
+      "pay.pay.settlement_expected": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "pay.pay.settlement_keys": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "acquirer.sim_charge": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "acquirer.sim_refund": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "acquirer.sim_refund_decline": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "acquirer.sim_payout": {
+        "rows": 2,
+        "sha256": "2ccdb0fec1ec3ef56c59f7aa87763a240fa13d74d722cbbfa745da9d41c01207"
+      },
+      "acquirer.sim_line": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "acquirer.sim_fee_estimate": {
+        "rows": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "bank.sim_bank_entry": {
+        "rows": 3,
+        "sha256": "7a1aefb07257be007b88fe1e5e375d9e4049a4a5b61c21340054a6174c998cc3"
+      }
+    },
+    "hash_method": "SHA-256 on all rows as PostgreSQL to_jsonb(row)::text, sorted, joined by LF with no trailing LF."
+  }
+}

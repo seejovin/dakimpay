@@ -1,0 +1,51 @@
+{
+  "all_original_tables_equal_after_first_and_second_upgrade": true,
+  "funded_balance_after_verified_original_refusal": {
+    "available": 100,
+    "currency": "USD",
+    "payment_id": "dp_79dad6345e6a2e16222b0ab30e104adf",
+    "pending_requested": 200,
+    "reserved": 200,
+    "review": false,
+    "succeeded": 700
+  },
+  "funded_balance_on_old_overcommit": {
+    "available": 0,
+    "currency": "USD",
+    "payment_id": "dp_79dad6345e6a2e16222b0ab30e104adf",
+    "pending_requested": 1000,
+    "reserved": 300,
+    "review": true,
+    "succeeded": 700
+  },
+  "merchant_refusal_id": "dr_78dcb034d62f78ffba53daadaa51c4da",
+  "original_payment_id": "dp_79dad6345e6a2e16222b0ab30e104adf",
+  "original_provider_charge": "ch_f8e26409-9b95-4b60-a726-6ed48995112c",
+  "original_table_fingerprints": {
+    "events": "4e9acc16a0fcba2181eb66b289241948087437645246342279a1d69ecb33ff0e",
+    "lines": "ac4d7425c1f17b7dd1d475eaa6e5b276ecc7ff477244cb289cdb93aed3ab4575",
+    "payments": "2e13b95b8430a43241eef973023a24ee989873ce9b9c7d95961d1f62f936506c",
+    "payouts": "e3f124b2d617f669e0f04f595807290126b55f7930f0ae2636ce861eec320e6a",
+    "processor_callback_conflicts": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "processor_callbacks": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "refunds": "acb518858b6f1e90164f779aab4e53e969a485965d0bb2ae20861b17b5f96302",
+    "settlement_expected": "a459b9972aeb96f3d313eadf95b1cfe117148d0f24548fcfc1be24564ca90188",
+    "settlement_keys": "46c765631f9b5b54709e7eb7224b5f4d20dc3353008155145e363d495edfc8bd",
+    "settlement_requests": "2d4f2eabb94f0e362de52e6ff27c956734479daea20b5bee020f8eec25f0ae0b"
+  },
+  "post_recovery_replay_and_restart_equal": true,
+  "post_recovery_table_fingerprints": {
+    "events": "8ffab578738ad99282e80f814d9448b780678f40e63768dd70ddc0cdfd5360fa",
+    "lines": "ac4d7425c1f17b7dd1d475eaa6e5b276ecc7ff477244cb289cdb93aed3ab4575",
+    "payments": "2e13b95b8430a43241eef973023a24ee989873ce9b9c7d95961d1f62f936506c",
+    "payouts": "e3f124b2d617f669e0f04f595807290126b55f7930f0ae2636ce861eec320e6a",
+    "processor_callback_conflicts": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "processor_callbacks": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "refunds": "1dcb98983ee562c9f8057200be7d31b2d286204be7d6af633e0fe2bad4849db7",
+    "settlement_expected": "a459b9972aeb96f3d313eadf95b1cfe117148d0f24548fcfc1be24564ca90188",
+    "settlement_keys": "46c765631f9b5b54709e7eb7224b5f4d20dc3353008155145e363d495edfc8bd",
+    "settlement_requests": "2d4f2eabb94f0e362de52e6ff27c956734479daea20b5bee020f8eec25f0ae0b"
+  },
+  "sibling_and_published_movement_fingerprint": "97bcc8dc305d07d8eda1a591114e431b97921026283ad4fb26c1ad5115fbd276",
+  "still_unresolved_sibling_id": "dr_dfb40787e6846a992b4a2ad579d5d938"
+}

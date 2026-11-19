@@ -1,0 +1,854 @@
+diff --git a/internal/server/commands.go b/internal/server/commands.go
+index bf8412d..c784cb7 100644
+--- a/internal/server/commands.go
++++ b/internal/server/commands.go
+@@ -84,6 +84,9 @@ func (s *Server) command(w http.ResponseWriter, r *http.Request) {
+ 				}
+ 			}
+ 		}
++		if e = classificationAccess(a, req.Action); e != nil {
++			return e
++		}
+ 		if requireAdmin(a) && sensitiveAction(req.Action) {
+ 			if e = requireFreshFactor(ctx, tx, r); e != nil {
+ 				return e
+@@ -165,6 +168,10 @@ func (s *Server) command(w http.ResponseWriter, r *http.Request) {
+ 		if e != nil {
+ 			return e
+ 		}
++		auditOutcome := "ok"
++		if replay, ok := result.(replayedCommandResult); ok {
++			result, auditOutcome = replay.result, "replay"
++		}
+ 		if a.Role == "kiosk" && req.Action == "commerce.card.start" {
+ 			if e = grantKioskReceipt(ctx, tx, a.Lane, sessionToken(r), idFromResult(result)); e != nil {
+ 				return e
+@@ -177,7 +184,7 @@ func (s *Server) command(w http.ResponseWriter, r *http.Request) {
+ 		if _, e = tx.Exec(ctx, "insert into retail.operation(id,actor,lane,action,digest,result) values($1,$2,$3,$4,$5,$6)", key, a.ID, a.Lane, req.Action, digest, out); e != nil {
+ 			return e
+ 		}
+-		_, e = tx.Exec(ctx, "insert into retail.audit_log(actor,role,lane,action,object_id,outcome,operation_id) values($1,$2,$3,$4,$5,'ok',$6)", a.ID, a.Role, a.Lane, req.Action, idFromResult(result), key)
++		_, e = tx.Exec(ctx, "insert into retail.audit_log(actor,role,lane,action,object_id,outcome,operation_id) values($1,$2,$3,$4,$5,$6,$7)", a.ID, a.Role, a.Lane, req.Action, idFromResult(result), auditOutcome, key)
+ 		return e
+ 	})
+ 	if err != nil {
+@@ -215,6 +222,9 @@ func (s *Server) operation(w http.ResponseWriter, r *http.Request) {
+ 		if e = tx.QueryRow(ctx, "select action,result from retail.operation where id=$1 and actor=$2", id, a.ID).Scan(&action, &out); e != nil {
+ 			return e
+ 		}
++		if e = classificationAccess(a, action); e != nil {
++			return e
++		}
+ 		if requireAdmin(a) && sensitiveAction(action) {
+ 			return requireFreshFactor(ctx, tx, r)
+ 		}
+diff --git a/internal/server/provider_refunds_test.go b/internal/server/provider_refunds_test.go
+index 968be53..ba33903 100644
+--- a/internal/server/provider_refunds_test.go
++++ b/internal/server/provider_refunds_test.go
+@@ -128,6 +128,9 @@ func TestProviderRefundRequiresOriginalReceiptAndLaterPostedDebit(t *testing.T)
+ 		t.Fatal(e)
+ 	}
+ 	close(debit, 409)
++
++	proposalTerms := map[string]any{"id": fixture.notice.ID, "batchId": debit, "category": concessionCategory, "reason": "Documented customer service concession", "evidenceRef": "SERVICE/12345"}
++	fin.command("finance.settlement.classification.propose", proposalTerms, "", 409)
+ 	count(0, "SELECT count(*) FROM provider_refund_applied")
+ 	count(0, "SELECT count(*) FROM settlement_journal WHERE batch_id=$1", debit)
+ 	fixture.posted = true
+@@ -157,6 +160,9 @@ func TestProviderRefundRequiresOriginalReceiptAndLaterPostedDebit(t *testing.T)
+ 	count(1, "SELECT count(*) FROM register_receipt")
+ 	count(0, "SELECT count(*) FROM register_refund")
+ 	count(0, "SELECT count(*) FROM settlement_journal s WHERE s.batch_id=$1 AND s.account NOT IN ('bank','provider_refund_suspense')", debit)
++	t.Run("reporting classification", func(t *testing.T) {
++		verifyReportingClassification(t, db, users, proposalTerms, receipt, first, debit)
++	})
+ 	// An actual later retail return must respect the original card balance.
+ 	// The clerk can record a request, but $3.60 can no longer be refunded.
+ 	request := cash.command("commerce.refundRequest", fields{"receiptId": receipt, "sku": "EGGS", "qtyMilli": 1000, "reason": "Original goods brought back after provider refund"}, "", 200)["id"]
+@@ -164,6 +170,26 @@ func TestProviderRefundRequiresOriginalReceiptAndLaterPostedDebit(t *testing.T)
+ 	count(0, "SELECT count(*) FROM card_attempt WHERE kind='refund'")
+ 	count(1, "SELECT count(*) FROM provider_refund_applied")
+ 
++	// A matched refund inside an overall credit is valid bank reconciliation,
++	// but cannot enter the separately bank-debited reporting workflow.
++	fixture.notice.ID, fixture.notice.Reference, fixture.notice.SourceOperation = "second-return", "second-refund", "second-operation"
++	fixture.notice.Sequence, fixture.notice.Amount = 2, 50
++	if err := cards.collectProviderRefunds(ctx, fixture); err != nil {
++		t.Fatal(err)
++	}
++	offset := statementLine{Reference: "fee-credit", Kind: "fee", Fee: -110}
++	second := statementLine{Reference: fixture.notice.ID, Original: remote, Kind: "provider_refund", Gross: -50}
++	credit := open("credit-batch", "credit-trace", 60, second, offset)
++	net := int64(60)
++	fixture.statement = providerStatement{Payout: "credit-batch", Bank: "credit-trace", Currency: "USD", Deposit: &net, Lines: []statementLine{second, offset}}
++	if err := cards.checkProviderStatement(ctx, fixture); err != nil {
++		t.Fatal(err)
++	}
++	close(credit, 200)
++	count(1, "SELECT count(*) FROM provider_refund_applied WHERE batch_id=$1", credit)
++	proposalTerms["id"], proposalTerms["batchId"] = fixture.notice.ID, credit
++	fin.command("finance.settlement.classification.propose", proposalTerms, "", 409)
++	count(0, "SELECT count(*) FROM classifiable_refund_debit WHERE batch_id=$1", credit)
+ }
+ 
+ func TestDakimExternallyDeclinedOriginalRefund(t *testing.T) {
+diff --git a/internal/server/refund_classification.go b/internal/server/refund_classification.go
+new file mode 100644
+index 0000000..32f3b47
+--- /dev/null
++++ b/internal/server/refund_classification.go
+@@ -0,0 +1,121 @@
++package server
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"strings"
++	"unicode"
++	"unicode/utf8"
++
++	"github.com/jackc/pgx/v5"
++	"mimi/internal/retail"
++)
++
++// The outer command persists a retry under its fresh request key, with an audit
++// outcome of replay. The original economic or reporting decision stays unique.
++type replayedCommandResult struct{ result any }
++
++// A historical request key may outlive the staff member's finance role.
++// Recheck reporting authority even when a saved operation satisfies the read.
++func classificationAccess(a retail.Actor, action string) error {
++	if strings.HasPrefix(action, "finance.settlement.classification.") && !requireAdmin(a) {
++		return retail.Fail(403, "Finance reporting permission required.")
++	}
++	return nil
++}
++
++func classificationResult(id, status string, inserted bool) any {
++	r := map[string]string{"id": id, "status": status}
++	if !inserted {
++		return replayedCommandResult{r}
++	}
++	return r
++}
++
++const concessionCategory = "merchant_funded_service_concession"
++
++func proposeRefundClassification(ctx context.Context, tx pgx.Tx, a retail.Actor, raw json.RawMessage) (any, error) {
++	var p struct{ ID, BatchID, Category, Reason, EvidenceRef string }
++	if err := parseInput(raw, &p); err != nil {
++		return nil, err
++	}
++	p.Reason = strings.TrimSpace(p.Reason)
++	if !statementRef.MatchString(p.ID) || !uuidRE.MatchString(p.BatchID) || p.Category != concessionCategory ||
++		utf8.RuneCountInString(p.Reason) < 4 || utf8.RuneCountInString(p.Reason) > 240 || strings.IndexFunc(p.Reason, unicode.IsControl) >= 0 ||
++		!statementRef.MatchString(p.EvidenceRef) {
++		return nil, retail.Fail(422, "Select the matched debit, service concession, a reason and an evidence reference.")
++	}
++	written, err := tx.Exec(ctx, `INSERT INTO provider_refund_classification_proposal(provider,merchant,adjustment_id,batch_id,category,reason,evidence_ref,proposed_by)
++	SELECT provider,merchant,adjustment_id,batch_id,$3,$4,$5,$6 FROM classifiable_refund_debit WHERE adjustment_id=$1 AND batch_id=$2
++	ON CONFLICT (provider,merchant,adjustment_id) DO NOTHING`, p.ID, p.BatchID, p.Category, p.Reason, p.EvidenceRef, a.ID)
++	if err != nil {
++		return nil, err
++	}
++	var id, status string
++	err = tx.QueryRow(ctx, `SELECT p.id,CASE WHEN ok.proposal_id IS NULL THEN 'pending_approval' ELSE 'approved' END
++	FROM provider_refund_classification_proposal p LEFT JOIN provider_refund_classification_approval ok ON ok.proposal_id=p.id
++	WHERE (p.adjustment_id,p.batch_id,p.category,p.reason,p.evidence_ref,p.proposed_by)=($1,$2,$3,$4,$5,$6)`,
++		p.ID, p.BatchID, p.Category, p.Reason, p.EvidenceRef, a.ID).Scan(&id, &status)
++	if errors.Is(err, pgx.ErrNoRows) {
++		return nil, retail.Fail(409, "A verified later bank debit and one unchanged proposal are required. Refresh the case.")
++	}
++	return classificationResult(id, status, written.RowsAffected() == 1), err
++}
++
++func approveRefundClassification(ctx context.Context, tx pgx.Tx, a retail.Actor, raw json.RawMessage) (any, error) {
++	var p struct{ ID, BatchID, ProposalID string }
++	if err := parseInput(raw, &p); err != nil {
++		return nil, err
++	}
++	if !statementRef.MatchString(p.ID) || !uuidRE.MatchString(p.BatchID) || !uuidRE.MatchString(p.ProposalID) {
++		return nil, retail.Fail(422, "Select the proposal tied to this matched bank debit.")
++	}
++	var proposer string
++	err := tx.QueryRow(ctx, `SELECT p.proposed_by FROM provider_refund_classification_proposal p
++	JOIN classifiable_refund_debit d USING(provider,merchant,adjustment_id,batch_id)
++	WHERE p.id=$1 AND p.adjustment_id=$2 AND p.batch_id=$3 FOR UPDATE OF p`, p.ProposalID, p.ID, p.BatchID).Scan(&proposer)
++	if errors.Is(err, pgx.ErrNoRows) {
++		return nil, retail.Fail(409, "The proposal must belong to this verified refund and bank debit.")
++	}
++	if err != nil {
++		return nil, err
++	}
++	if proposer == a.ID {
++		return nil, retail.Fail(403, "A different finance user, supervisor or owner must approve this classification.")
++	}
++	written, err := tx.Exec(ctx, `INSERT INTO provider_refund_classification_approval(proposal_id,approved_by)
++	VALUES($1,$2) ON CONFLICT(proposal_id) DO NOTHING`, p.ProposalID, a.ID)
++	if err != nil {
++		return nil, err
++	}
++	var same bool
++	err = tx.QueryRow(ctx, `SELECT approved_by=$2 FROM provider_refund_classification_approval WHERE proposal_id=$1`, p.ProposalID, a.ID).Scan(&same)
++	if err != nil {
++		return nil, err
++	}
++	if !same {
++		return nil, retail.Fail(409, "A different reviewer already approved this classification.")
++	}
++	return classificationResult(p.ProposalID, "approved", written.RowsAffected() == 1), nil
++}
++
++func providerRefundReport(ctx context.Context, tx pgx.Tx, actor, ref string) ([]map[string]any, error) {
++	return maps(ctx, tx, `SELECT n.adjustment_id id,n.payment_ref original,n.order_ref "orderRef",n.receipt_id "receiptId",
++ n.original_payout "originalPayout",n.original_bank "originalBank",n.source_ref "sourceReference",n.currency,n.amount_minor "amountMinor",n.occurred_at "occurredAt",
++ CASE WHEN n.debit_batch_id IS NOT NULL THEN 'bank_matched' WHEN n.original_batch_id IS NULL THEN 'review_original' ELSE 'awaiting_bank' END status,
++ n.debit_batch_id "debitBatchId",debit.bank_ref "debitBank",debit.payout_ref "debitPayout",
++ CASE WHEN ok.proposal_id IS NOT NULL THEN 'approved' WHEN p.id IS NOT NULL THEN 'pending_approval' ELSE 'unclassified' END "classificationStatus",
++ p.id "proposalId",p.category,p.reason,p.evidence_ref "evidenceRef",p.proposed_by "proposedBy",p.proposed_at "proposedAt",
++ ok.approved_by "approvedBy",ok.approved_at "approvedAt",proposer.name "proposedByName",approver.name "approvedByName",
++ d.batch_id IS NOT NULL AND p.id IS NULL "canPropose",
++ d.batch_id IS NOT NULL AND p.id IS NOT NULL AND ok.proposal_id IS NULL AND p.proposed_by<>$1 "canApprove"
++ FROM provider_refund_case n LEFT JOIN settlement_batch debit ON debit.id=n.debit_batch_id
++ LEFT JOIN classifiable_refund_debit d ON (d.provider,d.merchant,d.adjustment_id)=(n.provider,n.merchant,n.adjustment_id)
++ LEFT JOIN provider_refund_classification_proposal p ON (p.provider,p.merchant,p.adjustment_id)=(n.provider,n.merchant,n.adjustment_id)
++ LEFT JOIN provider_refund_classification_approval ok ON ok.proposal_id=p.id
++ LEFT JOIN staff proposer ON proposer.id=p.proposed_by LEFT JOIN staff approver ON approver.id=ok.approved_by
++ WHERE $2='' OR $2 IN (n.adjustment_id,n.payment_ref,n.receipt_id,n.source_ref,n.original_payout,n.original_bank,
++ n.debit_batch_id,debit.bank_ref,debit.payout_ref)
++ ORDER BY (n.debit_batch_id IS NULL) DESC,n.sequence_no DESC,n.provider,n.merchant LIMIT 100`, actor, ref)
++}
+diff --git a/internal/server/refund_classification_test.go b/internal/server/refund_classification_test.go
+new file mode 100644
+index 0000000..f643b04
+--- /dev/null
++++ b/internal/server/refund_classification_test.go
+@@ -0,0 +1,192 @@
++package server
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/url"
++	"reflect"
++	"testing"
++
++	"github.com/jackc/pgx/v5/pgxpool"
++)
++
++// Build on the preceding test's actual register sale, posted original deposit,
++// provider notice, independent bank feed and finance closure of the subsequent debit.
++func verifyReportingClassification(t *testing.T, db *pgxpool.Pool, staff map[string]*officeHTTPSession, terms map[string]any, receipt, original, debit string) {
++	t.Helper()
++	const propose = "finance.settlement.classification.propose"
++	const approve = "finance.settlement.classification.approve"
++	fin, review, cash, other := staff["finance"], staff["owner-a"], staff["cashier"], staff["owner-b"]
++	ctx := context.Background()
++	count := func(want int, q string, args ...any) {
++		t.Helper()
++		var n int
++		if e := db.QueryRow(ctx, q, args...).Scan(&n); e != nil || n != want {
++			t.Fatalf("got %d, want %d: %s: %v", n, want, q, e)
++		}
++	}
++	fingerprint := func() string {
++		t.Helper()
++		var v string
++		err := db.QueryRow(ctx, `SELECT jsonb_build_array(
++		 (SELECT jsonb_agg(j ORDER BY j.source,j.source_id,j.account,j.amount_minor) FROM tender_journal j),
++		 (SELECT jsonb_agg(s ORDER BY s.batch_id,s.account) FROM settlement_journal s),
++		 (SELECT jsonb_agg(c ORDER BY c.id) FROM card_attempt c),
++		 (SELECT jsonb_agg(r ORDER BY r.id) FROM register_receipt r),
++		 (SELECT jsonb_agg(r ORDER BY r.id) FROM register_refund r),
++		 (SELECT jsonb_agg(n ORDER BY n.sequence_no) FROM provider_refund_notice n),
++		 (SELECT jsonb_agg(m ORDER BY m.id) FROM stock_move m),
++		 (SELECT jsonb_agg(s ORDER BY s.id) FROM settlement_batch s))::text`).Scan(&v)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return v
++	}
++	caseRow := func(who *officeHTTPSession, ref string) map[string]any {
++		t.Helper()
++		result := who.request("GET", "/api/settlement/lookup?ref="+url.QueryEscape(ref), nil, "", 200)
++		rows := result["providerRefunds"].([]any)
++		if len(rows) != 1 {
++			t.Fatalf("refund lookup %s returned %d", ref, len(rows))
++		}
++		return rows[0].(map[string]any)
++	}
++	before := fingerprint()
++	row := caseRow(fin, receipt)
++	if row["canPropose"] != true || row["status"] != "bank_matched" || row["classificationStatus"] != "unclassified" {
++		t.Fatal(row)
++	}
++	cash.command(propose, terms, "", 403)
++	invalid := map[string]any{}
++	for k, v := range terms {
++		invalid[k] = v
++	}
++	invalid["category"] = "chargeback"
++	fin.command(propose, invalid, "", 422)
++	invalid["category"] = terms["category"]
++	invalid["batchId"] = original
++	fin.command(propose, invalid, "", 409)
++	id := retrySameCommand(t, fin, propose, terms, newOfficeKey())
++	again := fin.command(propose, terms, "", 200)
++	if again["id"] != id || again["status"] != "pending_approval" {
++		t.Fatal(again)
++	}
++	invalid["batchId"] = debit
++	invalid["reason"] = "Different business rationale"
++	fin.command(propose, invalid, "", 409)
++	other.command(propose, terms, "", 409)
++	row = caseRow(review, "bank-later")
++	if row["classificationStatus"] != "pending_approval" || row["canApprove"] != true || row["proposalId"] != id || row["canPropose"] != false || row["evidenceRef"] != terms["evidenceRef"] || caseRow(fin, "bank-later")["canApprove"] != false {
++		t.Fatal(row)
++	}
++	in := map[string]any{"id": terms["id"], "batchId": debit, "proposalId": id}
++	fin.command(approve, in, "", 403)
++	cash.command(approve, in, "", 403)
++	in["id"] = "different-refund"
++	review.command(approve, in, "", 409)
++	in["id"] = terms["id"]
++	in["proposalId"] = newOfficeKey()
++	review.command(approve, in, "", 409)
++	in["proposalId"] = id
++	in["batchId"] = original
++	review.command(approve, in, "", 409)
++	in["batchId"] = debit
++	review, approvalKey := raceClassificationReview(t, in, review, other)
++	if got := review.command(approve, in, approvalKey, 200)["id"]; got != id {
++		t.Fatal(got)
++	}
++	if retry := review.command(approve, in, "", 200); retry["status"] != "approved" || retry["id"] != id {
++		t.Fatal(retry)
++	}
++	state := caseRow(fin, "later")
++	if state["canApprove"] != false || state["canPropose"] != false || state["classificationStatus"] != "approved" || state["proposedBy"] == state["approvedBy"] || state["approvedByName"] == nil || state["reason"] != terms["reason"] || state["debitBank"] != "bank-later" || state["originalBank"] != "bank-first" {
++		t.Fatal(state)
++	}
++	for _, ref := range []string{receipt, "bank-first", "dr_external", debit} {
++		if !reflect.DeepEqual(state, caseRow(fin, ref)) {
++			t.Fatalf("report by %s did not bind same decision", ref)
++		}
++	}
++	count(1, "SELECT count(*) FROM provider_refund_classification_proposal")
++	count(1, "SELECT count(*) FROM provider_refund_classification_approval")
++	for _, ac := range []string{propose, approve} {
++		count(1, "SELECT count(*) FROM audit_log WHERE object_id=$1 AND action=$2 AND outcome='ok'", id, ac)
++		count(1, "SELECT count(*) FROM audit_log WHERE object_id=$1 AND action=$2 AND outcome='replay'", id, ac)
++	}
++	for _, q := range []string{
++		"UPDATE provider_refund_classification_proposal SET reason='Different evidence' WHERE id=$1",
++		"DELETE FROM provider_refund_classification_approval WHERE proposal_id=$1",
++		"UPDATE provider_refund_classification_approval SET approved_by=approved_by WHERE proposal_id=$1",
++	} {
++		if _, err := db.Exec(ctx, q, id); err == nil {
++			t.Fatalf("mutable decision: %s", q)
++		}
++	}
++	// A synthetic historical command record owned by today's cashier models a
++	// former reviewer without changing any access settings during the exercise.
++	staleKey := newOfficeKey()
++	encoded, err := json.Marshal(in)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = db.Exec(ctx, `INSERT INTO operation(id,actor,lane,action,digest,result)
++	SELECT $1,id,lane,$2,$3,jsonb_build_object('id',$4::text,'status','approved') FROM staff WHERE username='cashier'`, staleKey, approve, hashText(approve+"\x00"+string(encoded)), id); err != nil {
++		t.Fatal(err)
++	}
++	cash.command(approve, in, staleKey, 403)
++	cash.request("GET", "/api/command/"+staleKey, nil, "", 403)
++	if after := fingerprint(); after != before {
++		t.Fatal("reporting action changed financial, stock or receipt evidence")
++	}
++}
++
++// Two independent reviewers submit different request keys against the same
++// pending decision. Only the winner may replay the success.
++func raceClassificationReview(t *testing.T, in map[string]any, first, second *officeHTTPSession) (*officeHTTPSession, string) {
++	t.Helper()
++	payload, err := json.Marshal(map[string]any{"action": "finance.settlement.classification.approve", "input": in})
++	if err != nil {
++		t.Fatal(err)
++	}
++	type reply struct {
++		reviewer *officeHTTPSession
++		key      string
++		status   int
++		err      error
++	}
++	done := make(chan reply, 2)
++	start := make(chan struct{})
++	for _, staff := range []*officeHTTPSession{first, second} {
++		req, err := http.NewRequest(http.MethodPost, staff.base+"/api/command", bytes.NewReader(payload))
++		if err != nil {
++			t.Fatal(err)
++		}
++		key := newOfficeKey()
++		req.Header.Set("Origin", staff.base)
++		req.Header.Set("Content-Type", "application/json")
++		req.Header.Set("X-CSRF-Token", staff.csrf)
++		req.Header.Set("Idempotency-Key", key)
++		go func() {
++			<-start
++			result := reply{reviewer: staff, key: key}
++			resp, err := staff.client.Do(req)
++			if err == nil {
++				result.status = resp.StatusCode
++				resp.Body.Close()
++			}
++			result.err = err
++			done <- result
++		}()
++	}
++	close(start)
++	a, b := <-done, <-done
++	if a.status != 200 {
++		a, b = b, a
++	}
++	if a.err != nil || b.err != nil || a.status != 200 || b.status != 409 {
++		t.Fatalf("review race returned %d (%v) and %d (%v)", a.status, a.err, b.status, b.err)
++	}
++	return a.reviewer, a.key
++}
+diff --git a/internal/server/settlement.go b/internal/server/settlement.go
+index 48e8bc1..ec99dfd 100644
+--- a/internal/server/settlement.go
++++ b/internal/server/settlement.go
+@@ -26,6 +26,12 @@ func settlementCommand(ctx context.Context, tx pgx.Tx, a retail.Actor, action st
+ 	if !requireAdmin(a) {
+ 		return nil, retail.Fail(403, "Finance reporting permission required.")
+ 	}
++	switch action {
++	case "finance.settlement.classification.propose":
++		return proposeRefundClassification(ctx, tx, a, raw)
++	case "finance.settlement.classification.approve":
++		return approveRefundClassification(ctx, tx, a, raw)
++	}
+ 	if action == "finance.settlement.import" {
+ 		var p struct {
+ 			Payout   string          `json:"payout"`
+@@ -254,15 +260,13 @@ func settlementView(ctx context.Context, tx pgx.Tx, a retail.Actor) (any, error)
+ 	if e != nil {
+ 		return nil, e
+ 	}
+-	refunds, e := maps(ctx, tx, `SELECT adjustment_id id,payment_ref original,order_ref "orderRef",receipt_id "receiptId",
+-	original_payout "originalPayout",original_bank "originalBank",source_ref "sourceReference",currency,amount_minor "amountMinor",occurred_at "occurredAt",
+-	CASE WHEN debit_batch_id IS NOT NULL THEN 'bank_matched' WHEN original_batch_id IS NULL THEN 'review_original' ELSE 'awaiting_bank' END status
+-	FROM provider_refund_case ORDER BY (debit_batch_id IS NULL) DESC,sequence_no DESC LIMIT 100`)
++	refunds, e := providerRefundReport(ctx, tx, a.ID, "")
+ 	return map[string]any{"providerRefunds": refunds, "batches": batches, "unreconciled": open, "unsettledCount": unsettled, "drawerVariances": variances}, e
+ }
+ func (s *Server) settlementLines(w http.ResponseWriter, r *http.Request) {
+ 	ctx := r.Context()
+ 	var result any
++	var refunds []map[string]any
+ 	e := pgx.BeginFunc(ctx, s.DB, func(tx pgx.Tx) error {
+ 		a, e := s.authenticate(ctx, tx, r, false)
+ 		if e != nil {
+@@ -280,6 +284,9 @@ func (s *Server) settlementLines(w http.ResponseWriter, r *http.Request) {
+ 				return retail.Fail(422, "Enter the exact bank, payout or statement reference.")
+ 			}
+ 			result, e = statementSummaries(ctx, tx, ref)
++			if e == nil {
++				refunds, e = providerRefundReport(ctx, tx, a.ID, ref)
++			}
+ 			return e
+ 		}
+ 		result, e = maps(ctx, tx, `select remote_id reference,entry_kind kind,original_ref original,payout_ref payout,gross_minor "grossMinor",fee_minor "feeMinor",expected_minor "expectedMinor",result from settlement_match where batch_id=$1 order by remote_id`, r.PathValue("id"))
+@@ -289,5 +296,9 @@ func (s *Server) settlementLines(w http.ResponseWriter, r *http.Request) {
+ 		report(w, e)
+ 		return
+ 	}
+-	jsonReply(w, 200, map[string]any{"rows": result})
++	reply := map[string]any{"rows": result}
++	if r.PathValue("id") == "lookup" {
++		reply["providerRefunds"] = refunds
++	}
++	jsonReply(w, 200, reply)
+ }
+diff --git a/migrations/145_refund_classification.sql b/migrations/145_refund_classification.sql
+new file mode 100644
+index 0000000..bf8454f
+--- /dev/null
++++ b/migrations/145_refund_classification.sql
+@@ -0,0 +1,64 @@
++-- Reporting eligibility follows both posted bank movements and the exact
++-- refund line. A negative item in a positive net payout is outside this workflow.
++CREATE VIEW classifiable_refund_debit AS
++ SELECT n.provider,n.merchant,n.adjustment_id,n.debit_batch_id AS batch_id
++ FROM provider_refund_case n
++ JOIN settlement_batch original ON original.id=n.original_batch_id
++ JOIN settlement_journal first_bank ON first_bank.batch_id=original.id AND first_bank.account='bank'
++ JOIN settlement_batch debit ON debit.id=n.debit_batch_id
++ JOIN provider_statement_check ck ON ck.batch_id=debit.id AND ck.verified_at IS NOT NULL
++ JOIN settlement_line l ON l.batch_id=debit.id AND l.remote_id=n.adjustment_id
++ JOIN settlement_journal bank ON bank.batch_id=debit.id AND bank.account='bank'
++ JOIN settlement_journal suspense ON suspense.batch_id=debit.id AND suspense.account='provider_refund_suspense'
++ WHERE n.receipt_id IS NOT NULL AND n.original_batch_id<>n.debit_batch_id
++ AND n.original_bank<>debit.bank_ref AND original.status='closed' AND debit.status='closed'
++ AND first_bank.amount_minor=n.original_deposit_minor AND n.original_deposit_minor>0
++ AND debit.deposit_minor<0 AND bank.amount_minor=debit.deposit_minor AND suspense.amount_minor>=n.amount_minor
++ AND debit.provider=n.provider AND debit.merchant=n.merchant AND debit.currency=n.currency
++ AND debit.decided_at>=original.decided_at
++ AND l.entry_kind='provider_refund' AND l.gross_minor=-n.amount_minor AND l.original_ref=n.payment_ref;
++
++CREATE TABLE provider_refund_classification_proposal (
++ id text PRIMARY KEY DEFAULT gen_random_uuid()::text, provider text NOT NULL, merchant text NOT NULL,
++ adjustment_id text NOT NULL,batch_id text NOT NULL, category text NOT NULL CHECK(category='merchant_funded_service_concession'),
++ reason text NOT NULL CHECK(char_length(reason) BETWEEN 4 AND 240 AND reason=btrim(reason) AND reason !~ '[[:cntrl:]]'),
++ evidence_ref text NOT NULL CHECK(evidence_ref ~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$'),
++ proposed_by text NOT NULL REFERENCES staff, proposed_at timestamptz NOT NULL DEFAULT now(),
++ UNIQUE(provider,merchant,adjustment_id),
++ FOREIGN KEY(provider,merchant,adjustment_id) REFERENCES provider_refund_applied,
++ FOREIGN KEY(batch_id,adjustment_id) REFERENCES settlement_line(batch_id,remote_id)
++);
++CREATE TABLE provider_refund_classification_approval (
++ proposal_id text PRIMARY KEY REFERENCES provider_refund_classification_proposal,
++ approved_by text NOT NULL REFERENCES staff, approved_at timestamptz NOT NULL DEFAULT now()
++);
++
++CREATE FUNCTION validate_refund_classification() RETURNS trigger LANGUAGE plpgsql AS $$
++DECLARE
++ p provider_refund_classification_proposal%ROWTYPE;
++ actor_id text;
++BEGIN
++ IF TG_TABLE_NAME='provider_refund_classification_proposal' THEN
++   p:=NEW;
++   actor_id:=p.proposed_by;
++ ELSE
++   SELECT * INTO STRICT p FROM provider_refund_classification_proposal WHERE id=NEW.proposal_id;
++   actor_id:=NEW.approved_by;
++   IF actor_id=p.proposed_by THEN
++     RAISE EXCEPTION 'independent classification approval required' USING ERRCODE='23514';
++   END IF;
++ END IF;
++ IF NOT EXISTS(SELECT FROM staff WHERE id=actor_id AND active AND role IN ('finance','supervisor','owner'))
++ OR NOT EXISTS(SELECT FROM classifiable_refund_debit d WHERE
++ (d.provider,d.merchant,d.adjustment_id,d.batch_id)=(p.provider,p.merchant,p.adjustment_id,p.batch_id))
++ THEN RAISE EXCEPTION 'ineligible refund classification or reviewer' USING ERRCODE='23514'; END IF;
++ RETURN NEW;
++END $$;
++CREATE TRIGGER validate_refund_proposal BEFORE INSERT ON provider_refund_classification_proposal
++ FOR EACH ROW EXECUTE FUNCTION validate_refund_classification();
++CREATE TRIGGER validate_refund_approval BEFORE INSERT ON provider_refund_classification_approval
++ FOR EACH ROW EXECUTE FUNCTION validate_refund_classification();
++CREATE TRIGGER keep_refund_proposal BEFORE UPDATE OR DELETE ON provider_refund_classification_proposal
++ FOR EACH ROW EXECUTE FUNCTION protect_history();
++CREATE TRIGGER keep_refund_approval BEFORE UPDATE OR DELETE ON provider_refund_classification_approval
++ FOR EACH ROW EXECUTE FUNCTION protect_history();
+diff --git a/web/settlement.js b/web/settlement.js
+index 10c9d03..bb32c2f 100644
+--- a/web/settlement.js
++++ b/web/settlement.js
+@@ -13,8 +13,99 @@ import {
+   field,
+   parseDecimal,
+   pill,
++  moment,
+ } from './lib.js';
+ 
++const concession = 'merchant_funded_service_concession';
++const classificationNames = { [concession]: 'Merchant-funded service concession' };
++const classificationStates = {
++  unclassified: 'Awaiting classification',
++  pending_approval: 'Awaiting independent approval',
++  approved: 'Classification approved',
++};
++const refundStates = {
++  awaiting_bank: 'Awaiting bank debit',
++  review_original: 'Check original receipt and deposit',
++  bank_matched: 'Bank debit matched',
++};
++
++function classificationState(row) {
++  if (row.status !== 'bank_matched') return 'Available after bank match';
++  if (row.classificationStatus === 'unclassified' && !row.canPropose) return 'Review debit eligibility';
++  return classificationStates[row.classificationStatus] || 'Review eligibility';
++}
++
++function refundTable(refunds) {
++  return table(
++    ['Receipt / original payment', 'Provider refund', 'Original payout', 'Debit', 'Bank reconciliation', 'Classification'],
++    refunds.map((row) => {
++      let label = row.classificationStatus === 'approved' ? 'View classification' : 'View evidence';
++      if (row.canPropose) label = 'Propose classification';
++      if (row.canApprove) label = 'Review proposal';
++      return [
++        esc(row.receiptId || row.orderRef) + '<small>' + esc(row.original) + '</small>',
++        esc(row.id) + '<small>' + esc(row.sourceReference) + '</small>',
++        esc(row.originalPayout) + '<small>' + esc(row.originalBank) + '</small>',
++        esc(money(-row.amountMinor, row.currency)),
++        esc(refundStates[row.status] || row.status),
++        esc(classificationState(row)) +
++          '<div>' + button(label, 'settlement-classification', JSON.stringify([row.id, row.debitBatchId]), 'quiet') + '</div>',
++      ];
++    }),
++  );
++}
++
++async function reviewClassification(key) {
++  const [id, selectedBatch] = JSON.parse(key);
++  const data = await api('/api/settlement/lookup?ref=' + encodeURIComponent(id));
++  const matches = list(data.providerRefunds).filter((r) => r.id === id && (r.debitBatchId ?? null) === selectedBatch);
++  if (matches.length !== 1) throw Error('Refresh the reports to review this refund against its current bank evidence.');
++  const row = matches[0];
++  const staff = (name, staffId) => name && name !== staffId ? `${name} (${staffId})` : staffId;
++  const evidence =
++    pair('Receipt', row.receiptId || 'Awaiting verification') +
++    pair('Original payment', row.original) +
++    pair('Provider refund', row.id) +
++    pair('Provider refund reference', row.sourceReference) +
++    pair('Original payout', row.originalPayout) +
++    pair('Original deposit trace', row.originalBank) +
++    pair('Refund debit', money(-row.amountMinor, row.currency)) +
++    pair('Bank reconciliation', refundStates[row.status] || row.status) +
++    (row.debitBatchId
++      ? pair('Debit payout', row.debitPayout) + pair('Posted debit trace', row.debitBank) + pair('Debit statement', row.debitBatchId)
++      : '');
++  const prior = row.proposalId
++    ? pair('Classification', classificationNames[row.category] || row.category) +
++      pair('Reason', row.reason) + pair('Evidence reference', row.evidenceRef) +
++      pair('Proposal ID', row.proposalId) +
++      pair('Proposed by', staff(row.proposedByName, row.proposedBy)) + pair('Proposed at', moment(row.proposedAt)) +
++      (row.approvedBy ? pair('Approved by', staff(row.approvedByName, row.approvedBy)) + pair('Approved at', moment(row.approvedAt)) : '')
++    : '';
++  const terms = { id, batchId: row.debitBatchId };
++  const scope = '<p>This classification records the business reason in finance reports. Customer refunds, bank transfers, stock, tax and journal corrections each require a separate operation.</p>';
++  if (row.canPropose) {
++    modal('Propose refund classification',
++      evidence + pair('Classification', classificationNames[concession]) +
++      '<label class="field"><span>Business reason</span><input type="text" name="reason" minlength="4" maxlength="240" required></label>' +
++      field('Supporting evidence reference', 'evidenceRef', '', {
++        placeholder: 'e.g. SERVICE/CASE-102',
++        pattern: '[A-Za-z0-9][A-Za-z0-9._:\\/\\-]{0,127}',
++      }) + scope,
++      (f) => command('finance.settlement.classification.propose', {
++        ...terms, category: concession, reason: f.reason.trim(), evidenceRef: f.evidenceRef.trim(),
++      }, 'Classification proposed for independent review.'),
++      'Submit proposal');
++    return;
++  }
++  modal(row.canApprove ? 'Review refund classification' : 'Provider refund evidence',
++    evidence + prior + scope,
++    row.canApprove
++      ? () => command('finance.settlement.classification.approve',
++          { ...terms, proposalId: row.proposalId }, 'Reporting classification approved.')
++      : null,
++    'Approve classification', classificationState(row));
++}
++
+ export function settlementPanel() {
+   const book = context.data.settlement;
+   if (!book) return '';
+@@ -32,18 +123,7 @@ export function settlementPanel() {
+     esc(row.provider),
+     esc(money(row.grossMinor, row.currency)),
+   ]);
+-  const refundStates = {
+-    awaiting_bank: 'Awaiting bank debit',
+-    review_original: 'Check original receipt and deposit',
+-    bank_matched: 'Bank debit matched',
+-  };
+-  const providerRefunds = list(book.providerRefunds).map((row) => [
+-    esc(row.receiptId || row.orderRef) + '<small>' + esc(row.original) + '</small>',
+-    esc(row.id) + '<small>' + esc(row.sourceReference) + '</small>',
+-    esc(row.originalPayout) + '<small>' + esc(row.originalBank) + '</small>',
+-    esc(money(-row.amountMinor, row.currency)),
+-    esc(refundStates[row.status] || row.status),
+-  ]);
++  const providerRefunds = list(book.providerRefunds);
+   return (
+     panel(
+       'Cash-up differences awaiting review',
+@@ -70,13 +150,13 @@ export function settlementPanel() {
+         'No processor statements recorded.',
+       ),
+       button('Import statement', 'settlement-import', '', 'secondary') +
+-        button('Find statement', 'settlement-find', '', 'quiet'),
++        button('Find statement or refund', 'settlement-find', '', 'quiet'),
+     ) +
+     (providerRefunds.length
+       ? panel(
+           'Provider refunds after sale',
+           '<p>Bank matching posts the debit to provider refund suspense. Finance reviews any goods or tax adjustment separately.</p>' +
+-            table(['Receipt / original payment', 'Provider refund', 'Original payout', 'Debit', 'Bank reconciliation'], providerRefunds),
++            refundTable(providerRefunds),
+         )
+       : '') +
+     panel(
+@@ -130,26 +210,35 @@ function parseStatement(text) {
+ }
+ 
+ export async function settlementAction(act, id) {
++  if (act === 'settlement-classification') {
++    await reviewClassification(id);
++    return;
++  }
+   if (act === 'settlement-find') {
+     modal(
+-      'Find settlement statement',
+-      field('Bank, payout or statement reference', 'ref'),
++      'Find statement or provider refund',
++      field('Bank, payout, receipt or provider reference', 'ref'),
+       async (f) => {
+         const result = await api('/api/settlement/lookup?ref=' + encodeURIComponent(f.ref.trim()));
+-        modal(
+-          'Matching settlement statements',
+-          table(
+-            ['Payout', 'Bank entry', 'State', ''],
+-            list(result.rows).map((s) => [
+-              esc(s.payout),
+-              esc(s.bank),
+-              pill(s.status),
+-              button('Review statement', 'settlement-review', s.id, 'quiet'),
+-            ]),
+-            'No matching statement.',
+-          ),
+-          null,
++        const statements = list(result.rows);
++        const refunds = list(result.providerRefunds);
++        const statementList = table(
++          ['Payout', 'Bank entry', 'State', ''],
++          statements.map((s) => [
++            esc(s.payout),
++            esc(s.bank),
++            pill(s.status),
++            button('Review statement', 'settlement-review', s.id, 'quiet'),
++          ]),
++          'No matching statement or provider refund.',
+         );
++        if (!refunds.length) {
++          modal('Matching settlement statements', statementList, null);
++        } else if (!statements.length) {
++          modal('Matching provider refunds', refundTable(refunds), null);
++        } else {
++          modal('Matching statements and refunds', statementList + '<h3>Provider refunds</h3>' + refundTable(refunds), null);
++        }
+       },
+       'Find',
+     );
+diff --git a/webtest/refund-classification.cjs b/webtest/refund-classification.cjs
+new file mode 100644
+index 0000000..9ae3f9b
+--- /dev/null
++++ b/webtest/refund-classification.cjs
+@@ -0,0 +1,111 @@
++// Use the post-settlement refund fixture in a disposable Mimi installation.
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const { chromium } = require(process.env.PLAYWRIGHT_PATH || 'playwright');
++
++async function exercise() {
++  const origin = new URL(process.env.MIMI_UAT_URL);
++  assert.equal(origin.protocol, 'http:');
++  assert.equal(origin.hostname, '127.0.0.1');
++  const stage = process.env.MIMI_CLASSIFICATION_STAGE;
++  const id = process.env.MIMI_REFUND_ADJUSTMENT;
++  assert.ok(['eligible', 'approved', 'exercise'].includes(stage) && id);
++  const credentials = Object.fromEntries(fs.readFileSync(process.env.MIMI_UAT_CREDENTIALS, 'utf8').trim().split(/\r?\n/).map(line => line.split('\t')));
++  const browser = await chromium.launch({ executablePath: process.env.BROWSER_EXECUTABLE, headless: true });
++  const errors = [], commands = [];
++  async function operator(name) {
++    const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
++    page.on('pageerror', error => errors.push(error.message));
++    page.on('request', req => {
++      if (new URL(req.url()).pathname === '/api/command' && req.method() === 'POST') commands.push(req.postDataJSON().action);
++    });
++    await page.goto(origin.href);
++    assert.equal((await (await page.request.get(origin.origin + '/api/session')).json()).store.training, true);
++    await page.getByLabel('Username', { exact: true }).fill(name);
++    await page.getByLabel('Password', { exact: true }).fill(credentials[name]);
++    await page.getByRole('button', { name: 'Sign in', exact: true }).click();
++    await page.locator('#main-content').waitFor();
++    await page.goto(origin.origin + '/#reports');
++    await page.getByRole('heading', { name: 'Provider refunds after sale' }).waitFor();
++    return page;
++  }
++  const row = page => page.locator('#main-content tr').filter({ hasText: id });
++  const dialog = page => page.getByRole('dialog');
++  async function evidence(page) {
++    const response = await page.request.get(origin.origin + '/api/settlement/lookup?ref=' + encodeURIComponent(id));
++    assert.equal(response.status(), 200);
++    const matches = (await response.json()).providerRefunds.filter(r => r.id === id);
++    assert.equal(matches.length, 1);
++    return matches[0];
++  }
++  async function assertDetail(page, fact) {
++    const rendered = await dialog(page).innerText();
++    for (const value of [id, fact.receiptId, fact.original, fact.originalPayout, fact.originalBank,
++      fact.sourceReference, fact.debitBank, fact.debitPayout, fact.debitBatchId]) {
++      assert.ok(value && rendered.includes(value), 'Missing linked refund or bank evidence');
++    }
++    assert.equal(fact.amountMinor, 120);
++    assert.ok(rendered.includes('1.20') && rendered.includes('finance reports'));
++    if (fact.proposalId) {
++      for (const value of [fact.reason, fact.evidenceRef, fact.proposalId, fact.proposedBy]) {
++        assert.ok(value && rendered.includes(value), 'Missing classification proposal evidence');
++      }
++    }
++    if (fact.classificationStatus === 'approved') {
++      assert.ok(fact.approvedAt && fact.proposedAt && fact.proposedBy !== fact.approvedBy);
++      assert.ok(rendered.includes(fact.approvedBy) && rendered.includes('Approved at'));
++    }
++  }
++  async function findApproved(page) {
++    await page.reload();
++    await row(page).getByRole('button', { name: 'View classification' }).waitFor();
++    await page.getByRole('button', { name: 'Find statement or refund' }).click();
++    await dialog(page).getByRole('textbox').fill(id);
++    await dialog(page).getByRole('button', { name: 'Find', exact: true }).click();
++    await dialog(page).getByRole('button', { name: 'View classification' }).click();
++    await dialog(page).getByRole('heading', { name: 'Provider refund evidence' }).waitFor();
++    const fact = await evidence(page);
++    assert.equal(fact.classificationStatus, 'approved');
++    await assertDetail(page, fact);
++    assert.equal(await dialog(page).locator('button[type=submit]').count(), 0);
++  }
++  try {
++    // Mimi permits one active session per user. Keep the API exercise's
++    // finance and manager sessions active during the read-only checks.
++    const finance = await operator(stage === 'exercise' ? 'finance' : 'owner');
++    if (stage === 'approved') {
++      await findApproved(finance);
++    } else {
++      const initial = await evidence(finance);
++      assert.equal(initial.status, 'bank_matched');
++      assert.equal(initial.classificationStatus, 'unclassified');
++      await row(finance).getByRole('button', { name: 'Propose classification' }).click();
++      await dialog(finance).getByRole('heading', { name: 'Propose refund classification' }).waitFor();
++      await assertDetail(finance, initial);
++      if (stage === 'exercise') {
++        await dialog(finance).getByLabel('Business reason').fill('Customer care reviewed the merchant-funded service concession.');
++        await dialog(finance).getByLabel('Supporting evidence reference').fill('SERVICE/CASE-102');
++        await dialog(finance).getByRole('button', { name: 'Submit proposal' }).click();
++        await row(finance).getByRole('button', { name: 'View evidence' }).click();
++        await dialog(finance).getByText('Awaiting independent approval').waitFor();
++        assert.equal(await dialog(finance).locator('button[type=submit]').count(), 0);
++        const manager = await operator('manager');
++        await row(manager).getByRole('button', { name: 'Review proposal' }).click();
++        await dialog(manager).getByRole('heading', { name: 'Review refund classification' }).waitFor();
++        await assertDetail(manager, await evidence(manager));
++        await dialog(manager).getByRole('button', { name: 'Approve classification' }).click();
++        await row(manager).getByRole('button', { name: 'View classification' }).waitFor();
++        await findApproved(manager);
++      }
++    }
++    assert.deepEqual(commands, stage === 'exercise' ? [
++      'finance.settlement.classification.propose', 'finance.settlement.classification.approve',
++    ] : []);
++    assert.deepEqual(errors, []);
++    console.log('PASS finance browser ' + stage + ' · linked receipt, provider refund and both bank traces · classification controls and audit evidence');
++  } finally {
++    await browser.close();
++  }
++}
++
++exercise().catch(error => { console.error(error); process.exitCode = 1; });

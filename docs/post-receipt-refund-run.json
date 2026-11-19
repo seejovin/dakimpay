@@ -1,0 +1,82 @@
+{
+  "environment": "local simulated acquirer and bank; disposable Mimi store",
+  "verified_at": "2026-11-19T12:52:41.855715+00:00",
+  "currency": "USD",
+  "units": "cents",
+  "receipt": "d5e8eca7-223d-46ac-bf98-8b2cae540c3e",
+  "capture": {
+    "payment": "dp_89b819338bcc702c7919932db441cb84",
+    "reference": "ch_7ce35921-7efe-4c99-99eb-73f8f28c4cb3",
+    "amount": 360
+  },
+  "original_payout": "po_31222de2-91ac-427b-9928-056c0d9fec82",
+  "original_bank_entry": {
+    "trace": "bt_f1ab5fcd-f923-4743-959f-db97ac9457bf",
+    "merchant_id": "mimi",
+    "currency": "USD",
+    "amount": 353,
+    "status": "posted"
+  },
+  "source_refund": {
+    "operation_id": "sr_4142ea3c907749deac3cef39a904059f",
+    "charge_reference": "ch_7ce35921-7efe-4c99-99eb-73f8f28c4cb3",
+    "amount": 120,
+    "merchant_id": "mimi",
+    "currency": "USD",
+    "reference": "rf_f5922a99-a0c1-47ac-ab57-6a7a17d4a6c4",
+    "status": "succeeded",
+    "payment_id": "dp_89b819338bcc702c7919932db441cb84",
+    "origin": "acquirer",
+    "occurred_at": "2026-11-19T12:52:25.258298Z"
+  },
+  "finance_exception": {
+    "id": "dr_63adf8ad614de5f04c26f4a949e525ff",
+    "sequence": 1,
+    "receipt": "d5e8eca7-223d-46ac-bf98-8b2cae540c3e",
+    "original_bank": "bt_f1ab5fcd-f923-4743-959f-db97ac9457bf",
+    "original_deposit_minor": 353,
+    "states": [
+      "awaiting_bank",
+      "bank_matched"
+    ],
+    "count_after_replay": 1
+  },
+  "later_statement": {
+    "bank": "bt_51a25500-a4bc-4aba-8159-b185466c62d2",
+    "currency": "USD",
+    "depositMinor": -120,
+    "lines": [
+      {
+        "reference": "dr_63adf8ad614de5f04c26f4a949e525ff",
+        "grossMinor": -120,
+        "feeMinor": 0,
+        "kind": "provider_refund",
+        "original": "dp_89b819338bcc702c7919932db441cb84"
+      }
+    ],
+    "payout": "po_0fa6d789-5fff-47ef-8b4f-57158c3fc4e2"
+  },
+  "later_bank_lookup_http_before_post": 404,
+  "later_bank_after_post": {
+    "trace": "bt_51a25500-a4bc-4aba-8159-b185466c62d2",
+    "merchant_id": "mimi",
+    "currency": "USD",
+    "amount": -120,
+    "status": "posted"
+  },
+  "original_settlement_journal": [
+    "bank|353",
+    "card_clearing|-360",
+    "processing_fees|7"
+  ],
+  "later_settlement_journal": [
+    "bank|-120",
+    "provider_refund_suspense|120"
+  ],
+  "original_record_sha256_before": "2cab50a8030038532375ff314f2a050f8fcf2c55bd5d80daca08c3316dd3bdaf",
+  "original_record_sha256_after": "2cab50a8030038532375ff314f2a050f8fcf2c55bd5d80daca08c3316dd3bdaf",
+  "premature_close_http": 409,
+  "self_approval_http": 403,
+  "service_restarts": 2,
+  "concurrent_source_submissions": 4
+}

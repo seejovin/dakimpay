@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """Exercise an independently installed Mimi training POS using the external merchant API."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+import csv
+import io
 from http.cookiejar import CookieJar
-import json, os, socket, subprocess, tempfile, time, uuid
+import json, os, socket, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, build_opener, HTTPCookieProcessor
+from mimi_reversal_check import verify_reversal
+from mimi_late_refund_check import verify_late_refund
+if sys.argv[1:] not in ([], ["--hosted-only"], ["--finance-only"], ["--settlement-regression"]):
+    raise SystemExit("Usage: scripts/verify-mimi [--hosted-only | --finance-only | --settlement-regression]")
 repo=Path(__file__).resolve().parents[1]
 mimi=Path(os.environ.get("MIMI_SOURCE",repo.parent/"mimi"))
 if not (mimi/"scripts/mimi-dakim").exists():raise SystemExit("Set MIMI_SOURCE to a Mimi checkout with the dakim-simulator adapter.")
@@ -14,13 +21,17 @@ class Session:
         self.origin=origin
         self.http=build_opener(HTTPCookieProcessor(CookieJar()))
         self.csrf=""
-    def req(self,path,body=None,key=None):
+    def req(self,path,body=None,key=None,expect_error=None):
         h={"Origin":self.origin,"Content-Type":"application/json","X-CSRF-Token":self.csrf}
         if key:h["Idempotency-Key"]=key
         try:
             res=self.http.open(Request(self.origin+path,headers=h,data=None if body is None else json.dumps(body).encode()),timeout=15)
-            with res:return json.load(res)
-        except HTTPError as e:raise AssertionError((path,e.code,e.read().decode())) from None
+            with res:
+                if expect_error: raise AssertionError(f"{path} unexpectedly succeeded")
+                return json.load(res)
+        except HTTPError as e:
+            if e.code == expect_error: return json.load(e)
+            raise AssertionError((path,e.code,e.read().decode())) from None
     def cmd(self,act,data,key=None):
         return self.req("/api/command",{"action":act,"input":data},key or str(uuid.uuid4()))["result"]
 def until(fn):
@@ -44,6 +55,20 @@ with tempfile.TemporaryDirectory(prefix="dakim-mimi-") as tmp:
             s=Session(f"http://127.0.0.1:{m}")
             session=s.req("/api/login",{"username":name,"password":accounts[name]});assert session["store"]["training"];s.csrf=session["csrf"];return s
         cash,manager,finance=[login(x) for x in ["cashier","manager","finance"]]
+        dp=Session(f"http://127.0.0.1:{p}");dp.http.open(dp.origin+"/").read()
+        def restart_payment_services():
+            subprocess.run([launcher, "restart"], env=env, check=True, stdout=subprocess.DEVNULL)
+        def restart_apps():
+            subprocess.run([shop, "stop"], env=env, check=True, stdout=subprocess.DEVNULL)
+            restart_payment_services()
+            subprocess.run([shop, "start"], env=env, check=True, stdout=subprocess.DEVNULL)
+        if sys.argv[1:] == ["--finance-only"]:
+            verify_late_refund(cash, finance, manager, dp, env, repo, restart_apps, until)
+            sys.exit(0)
+        if sys.argv[1:] == ["--hosted-only"]:
+            from mimi_hosted_check import verify_hosted
+            verify_hosted(cash, dp, env, repo, restart_apps)
+            sys.exit(0)
         cash.cmd("commerce.open",{})
         def basket():return cash.req("/api/state?view=register")["commerce"]["basket"]
         for _ in range(2):
@@ -51,19 +76,28 @@ with tempfile.TemporaryDirectory(prefix="dakim-mimi-") as tmp:
         s=basket();amount=s["totalMinor"];assert amount==720,amount
         key=str(uuid.uuid4())
         pay_input={"basketId":s["id"],"version":s["version"],"expectedTotalMinor":amount,"quoteKey":s["quoteKey"]}
-        attempt=cash.cmd("commerce.card.start",pay_input,key)["id"]
-        assert cash.cmd("commerce.card.start",pay_input,key)["id"]==attempt
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            attempts = list(pool.map(lambda _: cash.cmd("commerce.card.start", pay_input, key)["id"], range(8)))
+        assert len(set(attempts)) == 1, attempts
+        attempt = attempts[0]
         def find_attempt():
             return next((t for t in cash.req("/api/state?view=register")["card"]["attempts"] if t["id"]==attempt and t["status"]=="succeeded"),None)
         receipt=until(find_attempt)["receiptId"]
         rid=cash.cmd("commerce.refundRequest",{"receiptId":receipt,"sku":"EGGS","qtyMilli":1000,"reason":"Training partial return"})["id"]
         manager.cmd("commerce.refundApprove",{"refundId":rid})
-        dp=Session(f"http://127.0.0.1:{p}");dp.http.open(dp.origin+"/").read()
         d=until(lambda:(d if d["totals"]["refunded"]==360 else None) if (d:=dp.req("/v1/dashboard")) else None)
         assert len(d["payments"])==1 and d["payments"][0]["brand"]=="amex" and len(d["refunds"])==1
         assert "unknown" in [e["kind"] for e in d["events"]]
         payout=dp.req("/v1/settle",{},str(uuid.uuid4()))
         assert payout["net"]==346 and payout["status"]=="in_transit"
+        merchant_api = Session(dp.origin)
+        token = (state / "merchant_token.key").read_text().strip()
+        merchant_api.http.addheaders = [("Authorization", "Bearer " + token)]
+        assert merchant_api.req("/v1/payments/" + d["payments"][0]["id"])["amount"] == amount
+        merchant_api.req("/callbacks/processor", {}, expect_error=401)
+        merchant_api.req("/v1/settle", {}, str(uuid.uuid4()), expect_error=403)
+        merchant_api.req("/app/bank-post/" + payout["bank_trace"], {}, expect_error=403)
+        dp.req("/v1/payouts/"+payout["id"]+"/statement",expect_error=409)
         dp.req("/app/bank-post/"+payout["bank_trace"],{})
         assert dp.req("/v1/reconcile",{})["matched"]==1
         statement=dp.req("/v1/payouts/"+payout["id"]+"/statement")
@@ -72,8 +106,33 @@ with tempfile.TemporaryDirectory(prefix="dakim-mimi-") as tmp:
             return any(t["kind"]=="refund" and t["status"]=="succeeded" for t in manager.req("/api/state")["card"]["attempts"])
         until(refund_posted)
         batch=finance.cmd("finance.settlement.import",statement)["id"]
+        close = {"action": "finance.settlement.close", "input": {"id": batch}}
+        finance.req("/api/command",close,str(uuid.uuid4()),expect_error=403)
         manager.cmd("finance.settlement.close",{"id":batch})
+        with finance.http.open(finance.origin+"/api/export/journal.csv") as ledger:
+            rows = list(csv.DictReader(io.StringIO(ledger.read().decode("utf-8-sig"))))
+        residuals = {}
+        payout_entries = []
+        for row in rows:
+            ref = (row["source"],row["source_id"],row["currency"])
+            residuals[ref] = residuals.get(ref,0) + int(row["amount_minor"])
+            if ref == ("settlement_decision",batch,"USD"):
+                payout_entries.append((row["account"],int(row["amount_minor"])))
+        assert residuals and all(value == 0 for value in residuals.values()), residuals
+        assert sorted(payout_entries) == [("bank",346),("card_clearing",-360),("processing_fees",14)], payout_entries
+        def verified_callbacks():
+            callbacks = dp.req("/v1/dashboard")["callbacks"]
+            confirmed = {(e["type"],e["operation_id"]) for e in callbacks if e["status"] == "applied"}
+            expected = {("payment.captured", d["payments"][0]["id"]),("refund.succeeded", d["refunds"][0]["id"])}
+            return len(callbacks) == 2 and confirmed == expected
+        until(verified_callbacks)
+        print("PASS eight concurrent POS requests → one operation; signed capture and refund checked; merchant-only bank posting, unposted export and same-person close denied; all per-source journals balanced")
         print("PASS separate Mimi register: 7.20 Amex test-card sale recovered, original 3.60 refund, 0.14 fee, 3.46 bank deposit independently closed in Mimi finance")
+        verify_reversal(cash, manager, finance, login("owner"), dp, merchant, mp, until, restart_payment_services)
+        verify_late_refund(cash, finance, manager, dp, env, repo, restart_apps, until)
+        if sys.argv[1:] != ["--settlement-regression"]:
+            from mimi_hosted_check import verify_hosted
+            verify_hosted(cash, dp, env, repo, restart_apps)
     finally:
         if (merchant/"service.pid").exists() or (merchant/"data").exists():
             subprocess.run([shop,"stop"],env=env,stdout=subprocess.DEVNULL)

@@ -1,0 +1,8 @@
+.DS_Store
+*.key
+.env
+*.log
+*.pid
+/dakimpay
+__pycache__/
+node_modules/

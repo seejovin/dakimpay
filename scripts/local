@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Manage the three loopback services and their private PostgreSQL databases."""
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from urllib.request import urlopen
+
+os.umask(0o077)
+repo = Path(__file__).resolve().parents[1]
+state = Path(os.environ.get("DAKIM_STATE_DIR", "~/.local/share/dakim-pay")).expanduser().resolve()
+state.mkdir(mode=0o700, parents=True, exist_ok=True)
+if state.stat().st_mode & 0o077:
+    sys.exit("The local state directory must be private (mode 0700).")
+socket = state / "run"
+socket.mkdir(exist_ok=True)
+binary = state / "dakimpay"
+pg = state / "postgres"
+roles = ("bank", "acquirer", "pay")
+ports = {k: int(os.environ.get("DAKIM_"+k.upper()+"_PORT", v)) for k,v in {"pay":8460,"acquirer":8461,"bank":8462}.items()}
+pgport = int(os.environ.get("DAKIM_PG_PORT", 55493))
+if len(set([*ports.values(),pgport])) != 4:
+    sys.exit("Select a different port for every service.")
+if any(p < 1 or p > 65535 for p in [*ports.values(),pgport]):
+    sys.exit("Invalid local port.")
+def url(role):
+    return f"http://127.0.0.1:{ports[role]}"
+def run(*args, **kwargs):
+    return subprocess.run([str(a) for a in args], check=True, **kwargs)
+def tools():
+    if os.getenv("DAKIM_PG_BIN"):
+        return Path(os.environ["DAKIM_PG_BIN"])
+    if shutil.which("pg_config"):
+        loc = Path(subprocess.check_output(["pg_config","--bindir"],text=True).strip())
+        if (loc/"initdb").is_file():
+            return loc
+    existing = Path.home()/".local/share/mimi/pg18/bin"
+    if (existing/"initdb").is_file():
+        return existing
+    sys.exit("Install PostgreSQL server tools and set DAKIM_PG_BIN to the bin directory.")
+def pg_setup():
+    b = tools()
+    if not (pg/"PG_VERSION").is_file():
+        run(b/"initdb","-D",pg,"-U","dakim_admin","--auth-local=trust","--auth-host=reject","--no-locale","-E","UTF8",stdout=subprocess.DEVNULL)
+    if subprocess.run([b/"pg_ctl","-D",pg,"status"],stdout=subprocess.DEVNULL).returncode:
+        # Reject punctuation that would enter the PostgreSQL/postmaster option string.
+        if any(c in str(socket) for c in "'\\\n"):
+            sys.exit("Use a state directory without backslashes, quotes or newlines.")
+        run(b/"pg_ctl","-D",pg,"-l",state/"postgres.log","-o",f"-k '{socket}' -p {pgport} -c listen_addresses='' -c unix_socket_permissions=0700","-w","start",stdout=subprocess.DEVNULL)
+    base=[b/"psql","-X","-qAt","-h",socket,"-p",str(pgport),"-U","dakim_admin","-d","postgres","-v","ON_ERROR_STOP=1"]
+    def sql(s):
+        return run(*base,"-c",s,capture_output=True,text=True).stdout.strip()
+    for role in roles:
+        name="dakim_"+role
+        if not sql(f"select 1 from pg_roles where rolname='{name}'"):
+            sql(f"create role {name} login")
+        if not sql(f"select 1 from pg_database where datname='{name}'"):
+            sql(f"create database {name} owner {name}")
+        sql(f"revoke connect on database {name} from public")
+def secret(name):
+    path=state/(name.lower()+".key")
+    if not path.exists():
+        with path.open("x") as f: f.write(secrets.token_urlsafe(40)+"\n")
+    if path.stat().st_mode & 0o077:
+        sys.exit(f"Credential permissions too broad: {path.name}")
+    return path.read_text().strip()
+def health(role):
+    try:
+        with urlopen(url(role)+"/health",timeout=0.4) as res:
+            return json.load(res)=={"ok":True,"service":role,"mode":"simulation"}
+    except Exception:
+        return False
+def owned_pid(role):
+    f=state/(role+".pid")
+    if not f.is_file():return None
+    try: pid=int(f.read_text())
+    except ValueError:return None
+    if pid < 2:return None
+    ps=subprocess.run(["ps","-p",str(pid),"-o","command="],text=True,capture_output=True)
+    return pid if ps.returncode==0 and ps.stdout.strip()==f"{binary} {role}" else None
+def stop():
+    for role in reversed(roles):
+        pid=owned_pid(role)
+        if pid:
+            with contextlib.suppress(ProcessLookupError):os.kill(pid,signal.SIGTERM)
+            limit=time.monotonic()+10
+            while owned_pid(role) and time.monotonic()<limit:time.sleep(.1)
+            if owned_pid(role):sys.exit(f"{role} did not stop; see {state}/{role}.log")
+        (state/(role+".pid")).unlink(missing_ok=True)
+def start():
+    pg_setup()
+    tmp=state/"dakimpay.next"
+    run("go","build","-trimpath","-o",tmp,".",cwd=repo)
+    tmp.replace(binary)
+    keys={k:secret(k) for k in ("service_token","instruction_token","post_token","approve_token","merchant_token","session_secret")}
+    cfg={"bank":["service_token","instruction_token","post_token"],"acquirer":["service_token","instruction_token","approve_token"],"pay":["service_token","merchant_token","session_secret","post_token","approve_token"]}
+    for role in roles:
+        if owned_pid(role):
+            if not health(role):sys.exit(f"{role} process exists but is unhealthy.")
+            continue
+        if health(role):sys.exit(f"{url(role)} already belongs to another installation.")
+        name="dakim_"+role
+        db=f"host='{socket}' port={pgport} user={name} dbname={name} sslmode=disable"
+        env={k:v for k,v in os.environ.items() if not k.startswith(("DAKIM_","PG"))}
+        env.update(DAKIM_ORIGIN=url(role),DAKIM_DB=db,DAKIM_BANK_URL=url("bank"),DAKIM_ACQUIRER_URL=url("acquirer"))
+        env.update({"DAKIM_"+k.upper():keys[k] for k in cfg[role]})
+        with (state/(role+".log")).open("ab") as log:
+            proc=subprocess.Popen([binary,role],env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True)
+        (state/(role+".pid")).write_text(str(proc.pid))
+        for _ in range(100):
+            if proc.poll() is not None:sys.exit(f"{role} exited; see {state}/{role}.log")
+            if health(role):break
+            time.sleep(.12)
+        else:sys.exit(f"{role} did not start; see {state}/{role}.log")
+    print("dakim pay simulation is running at",url("pay"))
+def main():
+    action=sys.argv[1] if len(sys.argv)==2 else ""
+    if action=="status":
+        for r in roles:print(r,"running" if owned_pid(r) and health(r) else "stopped",url(r))
+    elif action=="start":start()
+    elif action=="restart":stop();start()
+    elif action=="stop":
+        stop()
+        if (pg/"postmaster.pid").exists():run(tools()/"pg_ctl","-D",pg,"-m","fast","-w","stop",stdout=subprocess.DEVNULL)
+    else:sys.exit("Usage: scripts/local start|status|restart|stop")
+with (state/".launcher.lock").open("a") as lock:
+    fcntl.flock(lock,fcntl.LOCK_EX)
+    main()

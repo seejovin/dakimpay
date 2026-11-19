@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Replay independent HTTP evidence on a fresh, throwaway store. No external card network."""
+from contextlib import ExitStack
+from http.cookiejar import CookieJar
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import tempfile
+from urllib.error import HTTPError
+from urllib.request import Request, build_opener, HTTPCookieProcessor
+
+launcher = Path(__file__).with_name("local").resolve()
+def ports():
+    with ExitStack() as s:
+        sockets=[s.enter_context(socket.socket()) for _ in range(4)]
+        for v in sockets:v.bind(("127.0.0.1",0))
+        return [v.getsockname()[1] for v in sockets]
+with tempfile.TemporaryDirectory(prefix="dakim-shift-") as temp:
+    state=Path(temp)
+    p,a,b,g=ports()
+    env={**os.environ,"DAKIM_STATE_DIR":temp,"DAKIM_PAY_PORT":str(p),"DAKIM_ACQUIRER_PORT":str(a),"DAKIM_BANK_PORT":str(b),"DAKIM_PG_PORT":str(g)}
+    client=build_opener(HTTPCookieProcessor(CookieJar()))
+    base=f"http://127.0.0.1:{p}"
+    def call(path,data=None,key=None,expected=200,merchant=False):
+        body=None if data is None else json.dumps(data).encode()
+        headers={"Content-Type":"application/json","Origin":base}
+        if key:headers["Idempotency-Key"]=key
+        if merchant:headers["Authorization"]="Bearer "+(state/"merchant_token.key").read_text().strip()
+        try:
+            with client.open(Request(base+path,data=body,headers=headers),timeout=25) as res:
+                assert res.status in ([expected] if isinstance(expected,int) else expected),(path,res.status)
+                return json.load(res)
+        except HTTPError as e:
+            if e.code==expected:return json.load(e)
+            raise AssertionError((path,e.code,e.read().decode())) from None
+    try:
+        subprocess.run([launcher,"start"],env=env,check=True,stdout=subprocess.DEVNULL)
+        client.open(base+"/").read()
+        def sale(order,channel,brand,amount,lost=False):
+            v=dict(order_id=order,channel=channel,brand=brand,amount=amount,currency="USD",lose_response=lost)
+            if channel=="terminal":v["terminal_id"]="MIMI-01"
+            return call("/v1/payments",v,"key-"+order,(200,201,202)),v
+        terminal,v=sale("VERIFY-AMEX","terminal","amex",4200,True)
+        assert terminal["status"]=="unknown"
+        subprocess.run([launcher,"restart"],env=env,check=True,stdout=subprocess.DEVNULL)
+        again=call("/v1/payments",v,"key-VERIFY-AMEX");assert again["id"]==terminal["id"]
+        assert call("/v1/payments/"+terminal["id"]+"/recover",{})["status"]=="captured"
+        w,_=sale("VERIFY-WEB","online","mastercard",6800)
+        assert w["status"]=="awaiting_customer"
+        checkout=w["checkout_url"]
+        assert checkout.startswith(f"http://127.0.0.1:{a}/checkout/")
+        assert b"Approve simulated payment" in client.open(checkout).read()
+        assert b"Payment approved" in client.open(Request(checkout,data=b"",headers={"Origin":f"http://127.0.0.1:{a}"})).read()
+        w=call("/v1/payments/"+w["id"]+"/recover",{});assert w["status"]=="captured"
+        path="/v1/payments/"+w["id"]+"/refunds"
+        r=call(path,{"amount":1000},"verify-refund",(200,201,202))
+        assert r["status"]=="succeeded" and call(path,{"amount":1000},"verify-refund")["id"]==r["id"]
+        s=call("/v1/settle",{},"verify-payout",(200,201))
+        assert s["status"]=="in_transit" and sorted(row["amount"] for row in s["lines"])==[-1000,-170,-84,4200,6800]
+        assert s["net"]==9746 and call("/v1/reconcile",{})["pending"]==1
+        assert call("/v1/dashboard")["totals"]["deposited"]==0
+        call("/app/bank-post/"+s["bank_trace"],{})
+        assert call("/v1/reconcile",{})["matched"]==1
+        assert call("/v1/reconcile",{})["matched"]==0
+        normalized=call("/v1/payouts/"+s["id"]+"/statement")
+        assert {row["reference"] for row in normalized["lines"]}=={terminal["id"],w["id"],r["id"]}
+        assert sum(row["grossMinor"]-row["feeMinor"] for row in normalized["lines"])==normalized["depositMinor"]==9746
+        d=call("/v1/dashboard");assert d["totals"]=={"captured":11000,"refunded":1000,"fees":254,"deposited":9746,"pending_deposit":0}
+        guided=call("/app/demo",{});assert guided["deposited"]==9746
+        assert call("/app/demo",{})==guided
+        assert len(call("/v1/dashboard")["payments"])==4
+        for ch in ["terminal","online"]:
+            for brand in ["visa","mastercard","amex"]:
+                payment,_=sale("MATRIX-"+ch+"-"+brand,ch,brand,101)
+                if ch=="online":
+                    client.open(Request(payment["checkout_url"],data=b"",headers={"Origin":f"http://127.0.0.1:{a}"})).read()
+                    payment=call("/v1/payments/"+payment["id"]+"/recover",{})
+                assert payment["status"]=="captured"
+        print("PASS original terminal capture recovered after restart; hosted checkout approved; partial original refund replayed once")
+        print("PASS remittance 110.00 - 10.00 - 2.54 = 97.46; independent bank proof and Mimi statement matched")
+        print("PASS guided run isolated and replayable; six synthetic brand × channel combinations captured")
+    finally:
+        subprocess.run([launcher,"stop"],env=env,check=True,stdout=subprocess.DEVNULL)

@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Exercise an independently installed Mimi training POS using the external merchant API."""
+from contextlib import ExitStack
+from http.cookiejar import CookieJar
+import json, os, socket, subprocess, tempfile, time, uuid
+from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, build_opener, HTTPCookieProcessor
+repo=Path(__file__).resolve().parents[1]
+mimi=Path(os.environ.get("MIMI_SOURCE",repo.parent/"mimi"))
+if not (mimi/"scripts/mimi-dakim").exists():raise SystemExit("Set MIMI_SOURCE to a Mimi checkout with the dakim-simulator adapter.")
+class Session:
+    def __init__(self,origin):
+        self.origin=origin
+        self.http=build_opener(HTTPCookieProcessor(CookieJar()))
+        self.csrf=""
+    def req(self,path,body=None,key=None):
+        h={"Origin":self.origin,"Content-Type":"application/json","X-CSRF-Token":self.csrf}
+        if key:h["Idempotency-Key"]=key
+        try:
+            res=self.http.open(Request(self.origin+path,headers=h,data=None if body is None else json.dumps(body).encode()),timeout=15)
+            with res:return json.load(res)
+        except HTTPError as e:raise AssertionError((path,e.code,e.read().decode())) from None
+    def cmd(self,act,data,key=None):
+        return self.req("/api/command",{"action":act,"input":data},key or str(uuid.uuid4()))["result"]
+def until(fn):
+    for _ in range(150):
+        v=fn()
+        if v:return v
+        time.sleep(.15)
+    raise AssertionError("Timed out awaiting original receipt/refund")
+with tempfile.TemporaryDirectory(prefix="dakim-mimi-") as tmp:
+    with ExitStack() as stack:
+        socks=[stack.enter_context(socket.socket()) for _ in range(6)]
+        for s in socks:s.bind(("127.0.0.1",0))
+        p,a,b,g,m,mp=[s.getsockname()[1] for s in socks]
+    state=Path(tmp); merchant=state/"merchant"
+    env={**os.environ,"DAKIM_STATE_DIR":tmp,"DAKIM_PAY_PORT":str(p),"DAKIM_ACQUIRER_PORT":str(a),"DAKIM_BANK_PORT":str(b),"DAKIM_PG_PORT":str(g),"MIMI_LOCAL_DIR":str(merchant),"MIMI_PG_PORT":str(mp),"MIMI_LISTEN":f"127.0.0.1:{m}","MIMI_DAKIM_URL":f"http://127.0.0.1:{p}","MIMI_DAKIM_TEST_BRAND":"amex"}
+    launcher=repo/"scripts/local"; shop=mimi/"scripts/mimi-dakim"
+    try:
+        for script in [launcher,shop]:subprocess.run([script,"start"],env=env,check=True,stdout=subprocess.DEVNULL)
+        accounts=dict(line.split("\t",1) for line in (merchant/"first-sign-in.tsv").read_text().strip().splitlines())
+        def login(name):
+            s=Session(f"http://127.0.0.1:{m}")
+            session=s.req("/api/login",{"username":name,"password":accounts[name]});assert session["store"]["training"];s.csrf=session["csrf"];return s
+        cash,manager,finance=[login(x) for x in ["cashier","manager","finance"]]
+        cash.cmd("commerce.open",{})
+        def basket():return cash.req("/api/state?view=register")["commerce"]["basket"]
+        for _ in range(2):
+            s=basket();cash.cmd("commerce.add",{"basketId":s["id"],"version":s["version"],"code":"EGGS"})
+        s=basket();amount=s["totalMinor"];assert amount==720,amount
+        key=str(uuid.uuid4())
+        pay_input={"basketId":s["id"],"version":s["version"],"expectedTotalMinor":amount,"quoteKey":s["quoteKey"]}
+        attempt=cash.cmd("commerce.card.start",pay_input,key)["id"]
+        assert cash.cmd("commerce.card.start",pay_input,key)["id"]==attempt
+        def find_attempt():
+            return next((t for t in cash.req("/api/state?view=register")["card"]["attempts"] if t["id"]==attempt and t["status"]=="succeeded"),None)
+        receipt=until(find_attempt)["receiptId"]
+        rid=cash.cmd("commerce.refundRequest",{"receiptId":receipt,"sku":"EGGS","qtyMilli":1000,"reason":"Training partial return"})["id"]
+        manager.cmd("commerce.refundApprove",{"refundId":rid})
+        dp=Session(f"http://127.0.0.1:{p}");dp.http.open(dp.origin+"/").read()
+        d=until(lambda:(d if d["totals"]["refunded"]==360 else None) if (d:=dp.req("/v1/dashboard")) else None)
+        assert len(d["payments"])==1 and d["payments"][0]["brand"]=="amex" and len(d["refunds"])==1
+        assert "unknown" in [e["kind"] for e in d["events"]]
+        payout=dp.req("/v1/settle",{},str(uuid.uuid4()))
+        assert payout["net"]==346 and payout["status"]=="in_transit"
+        dp.req("/app/bank-post/"+payout["bank_trace"],{})
+        assert dp.req("/v1/reconcile",{})["matched"]==1
+        statement=dp.req("/v1/payouts/"+payout["id"]+"/statement")
+        # Mimi's payment worker may still be posting the retail side of the refund.
+        def refund_posted():
+            return any(t["kind"]=="refund" and t["status"]=="succeeded" for t in manager.req("/api/state")["card"]["attempts"])
+        until(refund_posted)
+        batch=finance.cmd("finance.settlement.import",statement)["id"]
+        manager.cmd("finance.settlement.close",{"id":batch})
+        print("PASS separate Mimi register: 7.20 Amex test-card sale recovered, original 3.60 refund, 0.14 fee, 3.46 bank deposit independently closed in Mimi finance")
+    finally:
+        if (merchant/"service.pid").exists() or (merchant/"data").exists():
+            subprocess.run([shop,"stop"],env=env,stdout=subprocess.DEVNULL)
+            if (merchant/"data/postmaster.pid").exists():
+                homebin=Path.home()/".local/share/mimi/pg18/bin"
+                pgbin=os.getenv("MIMI_PG_BIN") or (str(homebin) if (homebin/"pg_ctl").exists() else subprocess.check_output(["pg_config","--bindir"],text=True).strip())
+                subprocess.run([Path(pgbin)/"pg_ctl","-D",merchant/"data","-m","fast","-w","stop"],stdout=subprocess.DEVNULL,check=True)
+        subprocess.run([launcher,"stop"],env=env,stdout=subprocess.DEVNULL,check=True)

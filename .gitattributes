@@ -1,0 +1,2 @@
+# Unified patch context includes a space before source indentation.
+*.patch whitespace=-space-before-tab,-blank-at-eol

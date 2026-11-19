@@ -1,0 +1,240 @@
+diff --git a/internal/server/card_evidence.go b/internal/server/card_evidence.go
+index 3976066..8f724e0 100644
+--- a/internal/server/card_evidence.go
++++ b/internal/server/card_evidence.go
+@@ -50,6 +50,13 @@ func (c *CardService) proposeReference(ctx context.Context, tx pgx.Tx, a retail.
+ 	if c.Provider == "training" {
+ 		valid = strings.HasPrefix(in.Reference, "training-") && uuidRE.MatchString(strings.TrimPrefix(in.Reference, "training-"))
+ 	}
++	if c.Provider == "dakim-simulator" {
++		prefix = "dp_"
++		if kind == "refund" {
++			prefix = "dr_"
++		}
++		valid = safeRemoteID.MatchString(in.Reference) && strings.HasPrefix(in.Reference, prefix)
++	}
+ 	if !valid {
+ 		return nil, retail.Fail(422, "Reference format does not match this payment operation.")
+ 	}
+diff --git a/internal/server/cards.go b/internal/server/cards.go
+index 38b89fb..88053ea 100644
+--- a/internal/server/cards.go
++++ b/internal/server/cards.go
+@@ -47,6 +47,9 @@ func CardConfig(db *pgxpool.Pool, st Store) (*CardService, error) {
+ 		c.Adapter = &TrainingTerminal{DB: db}
+ 		return c, nil
+ 	}
++	if mode == "dakim-simulator" {
++		return configureDakim(c, st)
++	}
+ 	if mode != "stripe-test" && mode != "stripe-live" {
+ 		return nil, errors.New("unknown card adapter")
+ 	}
+@@ -213,7 +216,7 @@ func (c *CardService) view(ctx context.Context, tx pgx.Tx, a retail.Actor, regis
+ 	if attempts == nil {
+ 		attempts = []map[string]any{}
+ 	}
+-	return map[string]any{"enabled": ok, "canPay": can, "unattended": r.Unattended, "training": c.Provider == "training", "attempts": attempts}, e
++	return map[string]any{"enabled": ok, "canPay": can, "unattended": r.Unattended, "training": c.Provider == "training" || c.Provider == "dakim-simulator", "attempts": attempts}, e
+ }
+ func (c *CardService) lease(ctx context.Context) (j CardJob, err error) {
+ 	err = pgx.BeginFunc(ctx, c.DB, func(tx pgx.Tx) error {
+diff --git a/internal/server/dakim_terminal.go b/internal/server/dakim_terminal.go
+new file mode 100644
+index 0000000..6c41568
+--- /dev/null
++++ b/internal/server/dakim_terminal.go
+@@ -0,0 +1,168 @@
++package server
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"os"
++	"strings"
++	"time"
++)
++
++// DakimSimulator connects an isolated training till to dakim pay over its merchant API.
++// The payment provider owns the acquirer operation and the till stores only provider references.
++type DakimSimulator struct {
++	base, token, brand string
++	client             *http.Client
++}
++type dakimEvidence struct {
++	ID, Status, Reference, Currency, Channel, Brand string
++	Merchant                                        string `json:"merchant_id"`
++	Order                                           string `json:"order_id"`
++	Terminal                                        string `json:"terminal_id"`
++	Original                                        string `json:"payment_id"`
++	Operation                                       string `json:"merchant_operation"`
++	Amount                                          int64
++	Refunded                                        int64
++}
++
++func configureDakim(c *CardService, store Store) (*CardService, error) {
++	if !store.Training || store.Currency != "USD" || store.MinorDigits != 2 {
++		return nil, errors.New("dakim pay simulator requires a USD training store")
++	}
++	base := os.Getenv("MIMI_DAKIM_URL")
++	u, err := url.Parse(base)
++	if err != nil || u.Scheme != "http" || u.Hostname() != "127.0.0.1" || u.Port() == "" || u.Path != "" || u.RawQuery != "" || u.User != nil || u.Fragment != "" {
++		return nil, errors.New("dakim simulator requires an explicit local service origin")
++	}
++	path := os.Getenv("MIMI_DAKIM_TOKEN_FILE")
++	info, err := os.Stat(path)
++	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
++		return nil, errors.New("private dakim merchant credential required")
++	}
++	b, err := os.ReadFile(path)
++	if err != nil {
++		return nil, err
++	}
++	token := strings.TrimSpace(string(b))
++	if len(token) < 32 {
++		return nil, errors.New("invalid dakim merchant credential")
++	}
++	brand := os.Getenv("MIMI_DAKIM_TEST_BRAND")
++	if brand == "" {
++		brand = "visa"
++	}
++	if brand != "visa" && brand != "mastercard" && brand != "amex" {
++		return nil, errors.New("unknown simulated card brand")
++	}
++	c.Provider = "dakim-simulator"
++	c.Merchant = "mimi"
++	c.Readers = map[string]Reader{"Lane 1": {ID: "MIMI-01"}}
++	c.Adapter = &DakimSimulator{base: base, token: token, brand: brand, client: &http.Client{Timeout: 8 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
++	return c, nil
++}
++func (d *DakimSimulator) request(ctx context.Context, j CardJob, method, path, key string, body any) (CardFact, error) {
++	if j.Merchant != "mimi" || j.Provider != "dakim-simulator" || j.Currency != "USD" || j.Digits != 2 || j.Amount <= 0 || j.Reader != "MIMI-01" {
++		return CardFact{}, errors.New("invalid dakim merchant binding")
++	}
++	var input bytes.Buffer
++	if body != nil {
++		if err := json.NewEncoder(&input).Encode(body); err != nil {
++			return CardFact{}, err
++		}
++	}
++	req, err := http.NewRequestWithContext(ctx, method, d.base+path, &input)
++	if err != nil {
++		return CardFact{}, err
++	}
++	req.Header.Set("Authorization", "Bearer "+d.token)
++	if method == "POST" {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	if key != "" {
++		req.Header.Set("Idempotency-Key", key)
++	}
++	resp, err := d.client.Do(req)
++	if err != nil {
++		return CardFact{}, errors.New("dakim pay unavailable")
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode/100 != 2 {
++		return CardFact{}, fmt.Errorf("dakim pay returned HTTP %d", resp.StatusCode)
++	}
++	var f dakimEvidence
++	if err = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&f); err != nil {
++		return CardFact{}, err
++	}
++	prefix := "dp_"
++	if j.Kind == "refund" {
++		prefix = "dr_"
++	}
++	if !safeRemoteID.MatchString(f.ID) || !strings.HasPrefix(f.ID, prefix) || f.Merchant != j.Merchant || f.Amount != j.Amount || f.Currency != j.Currency || (j.Remote != "" && f.ID != j.Remote) {
++		return CardFact{}, errors.New("dakim pay evidence does not match the original operation")
++	}
++	result := CardFact{Remote: f.ID, State: "unknown"}
++	if j.Kind == "charge" {
++		if f.Order != "MIMI-"+j.ID || f.Channel != "terminal" || f.Terminal != j.Reader {
++			return CardFact{}, errors.New("dakim pay order or terminal mismatch")
++		}
++		if f.Refunded > 0 {
++			return result, errReversedReference
++		}
++		if f.Status == "captured" && f.Reference != "" {
++			result.State = "succeeded"
++		}
++	} else {
++		if f.Original != j.Original || f.Operation != j.ID {
++			return CardFact{}, errors.New("dakim pay refund parent or operation mismatch")
++		}
++		if f.Status == "succeeded" && f.Reference != "" {
++			result.State = "succeeded"
++		}
++	}
++	return result, nil
++}
++func (d *DakimSimulator) Create(ctx context.Context, j CardJob) (CardFact, error) {
++	if j.Kind == "refund" {
++		if !safeRemoteID.MatchString(j.Original) {
++			return CardFact{}, errors.New("invalid original payment")
++		}
++		return d.request(ctx, j, "POST", "/v1/payments/"+j.Original+"/refunds", j.ID, map[string]any{"amount": j.Amount})
++	}
++	return d.request(ctx, j, "POST", "/v1/payments", j.ID, map[string]any{"order_id": "MIMI-" + j.ID, "channel": "terminal", "terminal_id": j.Reader, "amount": j.Amount, "currency": j.Currency, "brand": d.brand, "lose_response": true})
++}
++
++// An accepted create already presented the synthetic card. Dispatch has no second financial effect.
++func (d *DakimSimulator) Dispatch(_ context.Context, _ CardJob) error { return nil }
++func (d *DakimSimulator) lookup(ctx context.Context, j CardJob, recover bool) (CardFact, error) {
++	if !safeRemoteID.MatchString(j.Remote) {
++		return CardFact{}, errors.New("missing original dakim pay reference")
++	}
++	resource := "/v1/payments/"
++	if j.Kind == "refund" {
++		resource = "/v1/refunds/"
++	}
++	path := resource + j.Remote
++	method := "GET"
++	if recover {
++		path += "/recover"
++		method = "POST"
++	}
++	return d.request(ctx, j, method, path, "", nil)
++}
++func (d *DakimSimulator) Inspect(ctx context.Context, j CardJob) (CardFact, error) {
++	return d.lookup(ctx, j, true)
++}
++func (d *DakimSimulator) OriginalReference(ctx context.Context, j CardJob) (CardFact, error) {
++	return d.lookup(ctx, j, false)
++}
++
++// Synthetic taps capture immediately. Resolve the original operation before authorizing the till to release a basket.
++func (d *DakimSimulator) Cancel(ctx context.Context, j CardJob) (CardFact, error) {
++	return d.Inspect(ctx, j)
++}
+diff --git a/scripts/mimi-dakim b/scripts/mimi-dakim
+new file mode 100755
+index 0000000..e563243
+--- /dev/null
++++ b/scripts/mimi-dakim
+@@ -0,0 +1,19 @@
++#!/bin/sh
++# Dedicated training-store installation for the independent dakim pay simulation.
++set -eu
++repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
++paystate=${DAKIM_STATE_DIR:-"$HOME/.local/share/dakim-pay"}
++export MIMI_LOCAL_DIR=${MIMI_LOCAL_DIR:-"$paystate/mimi-merchant"}
++export MIMI_PG_PORT=${MIMI_PG_PORT:-55494}
++export MIMI_LISTEN=${MIMI_LISTEN:-127.0.0.1:8379}
++export MIMI_DAKIM_URL=${MIMI_DAKIM_URL:-http://127.0.0.1:${DAKIM_PAY_PORT:-8460}}
++export MIMI_DAKIM_TOKEN_FILE="$paystate/merchant_token.key"
++export MIMI_CARD_MODE=dakim-simulator
++case "${1:-}" in
++ start)
++   [ -s "$MIMI_DAKIM_TOKEN_FILE" ] || { echo 'Start the separate dakim pay simulator first.' >&2; exit 1; }
++   if [ ! -f "$MIMI_LOCAL_DIR/first-sign-in.tsv" ]; then "$repo/scripts/mimi-local" setup --training; fi
++   exec "$repo/scripts/mimi-local" start ;;
++ stop|status) exec "$repo/scripts/mimi-local" "$1" ;;
++ *) echo 'Usage: scripts/mimi-dakim start|status|stop' >&2; exit 2 ;;
++esac

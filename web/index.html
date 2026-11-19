@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#20382f">
+  <link rel="icon" href="/mark.png" type="image/png">
+  <link rel="stylesheet" href="/app.css">
+  <title>Merchant overview · dakim pay</title>
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to workspace</a>
+  <header class="masthead">
+    <div class="wrap mast-inner">
+      <a href="#overview" class="wordmark" aria-label="dakim pay home"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>dakim <em>pay</em></a>
+      <div class="merchant"><span class="merchant-seal" aria-hidden="true">m</span><span>Mimi grocery</span><span class="sand-label">Simulator</span></div>
+    </div>
+  </header>
+  <div class="nav-shell"><nav class="wrap" aria-label="Workspace">
+    <a href="#overview" aria-current="page">Overview</a><a href="#payments">Payments</a><a href="#deposits">Deposits</a><a href="#activity">Activity</a>
+  </nav></div>
+  <main class="wrap" id="main" tabindex="-1">
+    <div class="page-head">
+      <div><p class="overline" id="section-kicker">Merchant workspace</p><h1 id="title">Merchant overview</h1></div>
+      <button class="btn primary" data-action="new"><span class="plus" aria-hidden="true">+</span> New sale</button>
+    </div>
+    <div id="notice" role="status" aria-live="polite"></div>
+    <div id="recovery"></div>
+    <div id="view" aria-busy="true"><p class="empty">Loading merchant records…</p></div>
+    <footer><span>dakim pay <span aria-hidden="true">/</span> Merchant services</span><span>Simulated acquirer and bank · USD</span></footer>
+  </main>
+  <dialog id="modal" aria-labelledby="dialog-title"><div id="dialog-content"></div></dialog>
+</body>
+</html>

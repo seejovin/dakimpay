@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Virtual terminal · dakim pay</title><link rel="stylesheet" href="/terminal.css"><script defer src="/terminal.js"></script></head>
+<body><header><strong>dakim<span> pay</span></strong><span class="mode">Virtual terminal</span></header>
+<main><section class="panel">
+<div id="sign-in"><h1>Connect reader</h1><p>Enter this virtual reader’s device credential.</p><form id="connect"><label for="credential">Reader credential</label><input id="credential" type="password" autocomplete="off" spellcheck="false" required><button class="primary" type="submit">Connect</button></form></div>
+<div id="reader" hidden><div class="row"><span id="location"></span><button id="disconnect" class="quiet" type="button">Disconnect</button></div><div id="idle"><h1>Ready for payment</h1><p>Start a terminal sale at the linked register.</p></div>
+<div id="pending" hidden><p class="label">Payment request</p><h1 id="amount"></h1><dl><dt>Merchant order</dt><dd id="order"></dd><dt>Operation</dt><dd id="op"></dd></dl><div id="card-choice" hidden><label for="instrument">Test card</label><select id="instrument"><option value="visa">Visa</option><option value="mastercard">Mastercard</option><option value="amex">American Express</option></select></div><div class="actions"><button id="approve" type="button" class="primary">Approve test payment</button><button id="decline" type="button">Decline</button></div></div>
+<div id="receipt" hidden><p class="label">Last decision</p><p id="outcome"></p></div></div>
+<p id="error" role="status"></p></section><p class="foot">Synthetic payments only. No card or PIN is required.</p></main></body></html>

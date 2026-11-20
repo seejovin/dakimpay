@@ -1,0 +1,2398 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "dakim pay merchant aggregation API",
+    "version": "2.0",
+    "description": "Merchant integration contract for the local virtual gateway and configured partner test connectors. Authenticate server-to-server. Amounts use integer minor units of the merchant program currency. Preserve order, allocation, quote, original operation and idempotency keys across retries. Only the gateway chooses the processor route. A capture, browser return or webhook alone does not authorize merchandise release. See [settlement and journal](gateway-finance.md) and [signed event delivery](gateway-webhooks.md)."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8480",
+      "description": "Default local aggregator from scripts/aggregator-local"
+    }
+  ],
+  "security": [
+    {
+      "merchantBearer": []
+    }
+  ],
+  "paths": {
+    "/v2/payment-methods": {
+      "get": {
+        "operationId": "discoverMethods",
+        "summary": "Discover merchant payment methods",
+        "description": "Supply the amount for the currently eligible methods, including sales suspensions. Omitting it returns the enrolled channel catalog. Recheck on create. Repeated or unknown query parameters return 400.",
+        "parameters": [
+          {
+            "name": "channel",
+            "in": "query",
+            "required": true,
+            "description": "Buyer channel.",
+            "schema": {
+              "$ref": "#/components/schemas/Channel"
+            }
+          },
+          {
+            "name": "amount_minor",
+            "in": "query",
+            "required": false,
+            "description": "Amount in merchant currency.",
+            "schema": {
+              "$ref": "#/components/schemas/PositiveMinor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Eligible methods. An empty array is valid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Methods"
+                },
+                "example": {
+                  "currency": "USD",
+                  "channel": "hosted",
+                  "methods": [
+                    "card",
+                    "wechat_pay"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer credential.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient role, program grant or origin permission.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "421": {
+            "description": "HTTP Host does not match the configured gateway origin.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid parameters, command body or idempotency key.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Gateway or original provider temporarily unavailable. Recover against the original identifiers.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v2/payment-intents": {
+      "post": {
+        "operationId": "createPayment",
+        "summary": "Create or recover an original payment",
+        "description": "Commit a payment instruction for the authenticated merchant. Queued status means the gateway has accepted the instruction. On a lost response, replay unchanged terms with the original request key. A retry cannot select a new acquiring route.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateIntent"
+              },
+              "example": {
+                "payment_method": "card",
+                "order_id": "basket-1047",
+                "allocation_id": "tender-1",
+                "outlet_id": "store-1",
+                "channel": "hosted",
+                "amount_minor": 1234,
+                "currency": "USD"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "New instruction.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                },
+                "example": {
+                  "payment_method": "card",
+                  "order_id": "basket-1047",
+                  "allocation_id": "tender-1",
+                  "outlet_id": "store-1",
+                  "channel": "hosted",
+                  "amount_minor": 1234,
+                  "currency": "USD",
+                  "id": "pi_11111111111111111111111111111111",
+                  "operation_id": "pi_11111111111111111111111111111111",
+                  "merchant_id": "mimi",
+                  "processor_account": "acq-mimi",
+                  "kind": "charge",
+                  "quote_version": "1",
+                  "status": "queued",
+                  "refunded_minor": 0,
+                  "reserved_refund_minor": 0,
+                  "version": 1,
+                  "created_at": "2026-11-20T00:00:00Z",
+                  "updated_at": "2026-11-20T00:00:00Z",
+                  "route_id": "cards-primary",
+                  "provider_account": "mid-mimi",
+                  "connector_id": "cards"
+                }
+              }
+            },
+            "headers": {
+              "Location": {
+                "description": "Relative path to the original resource.",
+                "schema": {
+                  "type": "string",
+                  "format": "uri-reference"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Identical replay. Returns the current state of the same operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                },
+                "example": {
+                  "payment_method": "card",
+                  "order_id": "basket-1047",
+                  "allocation_id": "tender-1",
+                  "outlet_id": "store-1",
+                  "channel": "hosted",
+                  "amount_minor": 1234,
+                  "currency": "USD",
+                  "id": "pi_11111111111111111111111111111111",
+                  "operation_id": "pi_11111111111111111111111111111111",
+                  "merchant_id": "mimi",
+                  "processor_account": "acq-mimi",
+                  "kind": "charge",
+                  "quote_version": "1",
+                  "status": "captured",
+                  "refunded_minor": 0,
+                  "reserved_refund_minor": 0,
+                  "version": 3,
+                  "created_at": "2026-11-20T00:00:00Z",
+                  "updated_at": "2026-11-20T00:00:00Z",
+                  "route_id": "cards-primary",
+                  "provider_account": "mid-mimi",
+                  "connector_id": "cards",
+                  "reference": "mv_capture_1047",
+                  "card_brand": "visa"
+                }
+              }
+            },
+            "headers": {
+              "Location": {
+                "description": "Relative path to the original resource.",
+                "schema": {
+                  "type": "string",
+                  "format": "uri-reference"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer credential.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient role, program grant or origin permission.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "421": {
+            "description": "HTTP Host does not match the configured gateway origin.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid parameters, command body or idempotency key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflicting original terms, allocation, reservation, suspension or financial evidence.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "idempotency_conflict"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No eligible route for the requested method, channel, amount and currency.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "payment_method_unavailable"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Gateway or original provider temporarily unavailable. Recover against the original identifiers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v2/payment-intents/{id}": {
+      "get": {
+        "operationId": "getPayment",
+        "summary": "Read the original payment",
+        "description": "Look up the original resource within the merchant program and authorized outlet.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/OriginalID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current original operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                },
+                "example": {
+                  "payment_method": "card",
+                  "order_id": "basket-1047",
+                  "allocation_id": "tender-1",
+                  "outlet_id": "store-1",
+                  "channel": "hosted",
+                  "amount_minor": 1234,
+                  "currency": "USD",
+                  "id": "pi_11111111111111111111111111111111",
+                  "operation_id": "pi_11111111111111111111111111111111",
+                  "merchant_id": "mimi",
+                  "processor_account": "acq-mimi",
+                  "kind": "charge",
+                  "quote_version": "1",
+                  "status": "captured",
+                  "refunded_minor": 0,
+                  "reserved_refund_minor": 0,
+                  "version": 3,
+                  "created_at": "2026-11-20T00:00:00Z",
+                  "updated_at": "2026-11-20T00:00:00Z",
+                  "route_id": "cards-primary",
+                  "provider_account": "mid-mimi",
+                  "connector_id": "cards",
+                  "reference": "mv_capture_1047",
+                  "card_brand": "visa"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer credential.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient role, program grant or origin permission.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "421": {
+            "description": "HTTP Host does not match the configured gateway origin.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Original missing or inaccessible within this merchant program.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "operation_not_found"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Gateway or original provider temporarily unavailable. Recover against the original identifiers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v2/refunds/{id}": {
+      "get": {
+        "operationId": "getRefund",
+        "summary": "Read the original refund",
+        "description": "Look up the original resource within the merchant program and authorized outlet.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/OriginalID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current original operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                },
+                "example": {
+                  "payment_method": "card",
+                  "order_id": "basket-1047",
+                  "allocation_id": "tender-1",
+                  "outlet_id": "store-1",
+                  "channel": "hosted",
+                  "amount_minor": 800,
+                  "currency": "USD",
+                  "id": "rf_22222222222222222222222222222222",
+                  "operation_id": "rf_22222222222222222222222222222222",
+                  "merchant_id": "mimi",
+                  "processor_account": "acq-mimi",
+                  "kind": "refund",
+                  "quote_version": "1",
+                  "status": "queued",
+                  "refunded_minor": 0,
+                  "reserved_refund_minor": 0,
+                  "version": 1,
+                  "created_at": "2026-11-20T00:00:00Z",
+                  "updated_at": "2026-11-20T00:00:00Z",
+                  "route_id": "cards-primary",
+                  "provider_account": "mid-mimi",
+                  "connector_id": "cards",
+                  "parent_id": "pi_11111111111111111111111111111111",
+                  "merchant_refund_id": "return-1047-1"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer credential.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient role, program grant or origin permission.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "421": {
+            "description": "HTTP Host does not match the configured gateway origin.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Original missing or inaccessible within this merchant program.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "operation_not_found"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Gateway or original provider temporarily unavailable. Recover against the original identifiers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v2/operations/{id}": {
+      "get": {
+        "operationId": "getOperation",
+        "summary": "Read a payment or refund by operation ID",
+        "description": "Look up the original resource within the merchant program and authorized outlet.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/OriginalID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current original operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer credential.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient role, program grant or origin permission.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "421": {
+            "description": "HTTP Host does not match the configured gateway origin.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Original missing or inaccessible within this merchant program.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "operation_not_found"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Gateway or original provider temporarily unavailable. Recover against the original identifiers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v2/payment-intents/{id}/refunds": {
+      "post": {
+        "operationId": "createRefund",
+        "summary": "Refund the original captured payment",
+        "description": "Supply a stable merchant_refund_id and request key. A matching business refund identity also resolves to the existing refund. The gateway reserves available value and uses the original acquiring route. Rejected or unresolved attempts must be reconciled before trying a different economic instruction.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/OriginalID"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRefund"
+              },
+              "example": {
+                "merchant_refund_id": "return-1047-1",
+                "amount_minor": 800
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Refund instruction and reservation created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                },
+                "example": {
+                  "payment_method": "card",
+                  "order_id": "basket-1047",
+                  "allocation_id": "tender-1",
+                  "outlet_id": "store-1",
+                  "channel": "hosted",
+                  "amount_minor": 800,
+                  "currency": "USD",
+                  "id": "rf_22222222222222222222222222222222",
+                  "operation_id": "rf_22222222222222222222222222222222",
+                  "merchant_id": "mimi",
+                  "processor_account": "acq-mimi",
+                  "kind": "refund",
+                  "quote_version": "1",
+                  "status": "queued",
+                  "refunded_minor": 0,
+                  "reserved_refund_minor": 0,
+                  "version": 1,
+                  "created_at": "2026-11-20T00:00:00Z",
+                  "updated_at": "2026-11-20T00:00:00Z",
+                  "route_id": "cards-primary",
+                  "provider_account": "mid-mimi",
+                  "connector_id": "cards",
+                  "parent_id": "pi_11111111111111111111111111111111",
+                  "merchant_refund_id": "return-1047-1"
+                }
+              }
+            },
+            "headers": {
+              "Location": {
+                "description": "Relative path to the original resource.",
+                "schema": {
+                  "type": "string",
+                  "format": "uri-reference"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Existing refund on replay.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                },
+                "example": {
+                  "payment_method": "card",
+                  "order_id": "basket-1047",
+                  "allocation_id": "tender-1",
+                  "outlet_id": "store-1",
+                  "channel": "hosted",
+                  "amount_minor": 800,
+                  "currency": "USD",
+                  "id": "rf_22222222222222222222222222222222",
+                  "operation_id": "rf_22222222222222222222222222222222",
+                  "merchant_id": "mimi",
+                  "processor_account": "acq-mimi",
+                  "kind": "refund",
+                  "quote_version": "1",
+                  "status": "queued",
+                  "refunded_minor": 0,
+                  "reserved_refund_minor": 0,
+                  "version": 1,
+                  "created_at": "2026-11-20T00:00:00Z",
+                  "updated_at": "2026-11-20T00:00:00Z",
+                  "route_id": "cards-primary",
+                  "provider_account": "mid-mimi",
+                  "connector_id": "cards",
+                  "parent_id": "pi_11111111111111111111111111111111",
+                  "merchant_refund_id": "return-1047-1"
+                }
+              }
+            },
+            "headers": {
+              "Location": {
+                "description": "Relative path to the original resource.",
+                "schema": {
+                  "type": "string",
+                  "format": "uri-reference"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer credential.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient role, program grant or origin permission.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "421": {
+            "description": "HTTP Host does not match the configured gateway origin.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid parameters, command body or idempotency key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Original missing or inaccessible within this merchant program.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflicting original terms, allocation, reservation, suspension or financial evidence.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "insufficient_refundable_amount"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Gateway or original provider temporarily unavailable. Recover against the original identifiers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v2/payment-intents/{id}/release-evidence": {
+      "get": {
+        "operationId": "readReleaseEvidence",
+        "summary": "Check evidence before the first release of goods",
+        "description": "Require complete=true and release_eligible=true for the matching order, amount, currency and outlet. An HTTP 200 can describe an ineligible sale or incomplete provider evidence. A buyer return or an approved presentation does not substitute for these checks.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/OriginalID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Point-in-time comparison of local financial state and the original processor.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleaseEvidence"
+                },
+                "example": {
+                  "payment": {
+                    "payment_method": "card",
+                    "order_id": "basket-1047",
+                    "allocation_id": "tender-1",
+                    "outlet_id": "store-1",
+                    "channel": "hosted",
+                    "amount_minor": 1234,
+                    "currency": "USD",
+                    "id": "pi_11111111111111111111111111111111",
+                    "operation_id": "pi_11111111111111111111111111111111",
+                    "merchant_id": "mimi",
+                    "processor_account": "acq-mimi",
+                    "kind": "charge",
+                    "quote_version": "1",
+                    "status": "captured",
+                    "refunded_minor": 0,
+                    "reserved_refund_minor": 0,
+                    "version": 3,
+                    "created_at": "2026-11-20T00:00:00Z",
+                    "updated_at": "2026-11-20T00:00:00Z",
+                    "route_id": "cards-primary",
+                    "provider_account": "mid-mimi",
+                    "connector_id": "cards",
+                    "reference": "mv_capture_1047",
+                    "card_brand": "visa"
+                  },
+                  "release_eligible": true,
+                  "complete": true,
+                  "reason": "verified_capture",
+                  "processor_observed_at": "2026-11-20T00:00:00Z",
+                  "gateway_observed_at": "2026-11-20T00:00:00Z",
+                  "processor_capture_reference": "mv_capture_1047",
+                  "processor_refunded_minor": 0,
+                  "reserved_refund_minor": 0,
+                  "dispute_status": "none",
+                  "financial_exception": false
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Original evidence unavailable. Keep the order on hold.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "processor_inventory_unavailable"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer credential.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient role, program grant or origin permission.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "421": {
+            "description": "HTTP Host does not match the configured gateway origin.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Original missing or inaccessible within this merchant program.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v2/payment-intents/{id}/release-eligibility": {
+      "get": {
+        "operationId": "readReleaseEligibility",
+        "summary": "Check evidence before the first release of goods",
+        "description": "Require complete=true and release_eligible=true for the matching order, amount, currency and outlet. An HTTP 200 can describe an ineligible sale or incomplete provider evidence. A buyer return or an approved presentation does not substitute for these checks.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/OriginalID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Point-in-time comparison of local financial state and the original processor.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleaseEvidence"
+                },
+                "example": {
+                  "payment": {
+                    "payment_method": "card",
+                    "order_id": "basket-1047",
+                    "allocation_id": "tender-1",
+                    "outlet_id": "store-1",
+                    "channel": "hosted",
+                    "amount_minor": 1234,
+                    "currency": "USD",
+                    "id": "pi_11111111111111111111111111111111",
+                    "operation_id": "pi_11111111111111111111111111111111",
+                    "merchant_id": "mimi",
+                    "processor_account": "acq-mimi",
+                    "kind": "charge",
+                    "quote_version": "1",
+                    "status": "captured",
+                    "refunded_minor": 0,
+                    "reserved_refund_minor": 0,
+                    "version": 3,
+                    "created_at": "2026-11-20T00:00:00Z",
+                    "updated_at": "2026-11-20T00:00:00Z",
+                    "route_id": "cards-primary",
+                    "provider_account": "mid-mimi",
+                    "connector_id": "cards",
+                    "reference": "mv_capture_1047",
+                    "card_brand": "visa"
+                  },
+                  "release_eligible": true,
+                  "complete": true,
+                  "reason": "verified_capture",
+                  "processor_observed_at": "2026-11-20T00:00:00Z",
+                  "gateway_observed_at": "2026-11-20T00:00:00Z",
+                  "processor_capture_reference": "mv_capture_1047",
+                  "processor_refunded_minor": 0,
+                  "reserved_refund_minor": 0,
+                  "dispute_status": "none",
+                  "financial_exception": false
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Original evidence unavailable. Keep the order on hold.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "processor_inventory_unavailable"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer credential.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient role, program grant or origin permission.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "421": {
+            "description": "HTTP Host does not match the configured gateway origin.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Original missing or inaccessible within this merchant program.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v2/events": {
+      "get": {
+        "operationId": "listEvents",
+        "summary": "Read scoped financial workflow events",
+        "description": "Use next_cursor as the next after value even when a page has no events. Sequence is merchant-wide and filtered by account and outlet. Process events idempotently; re-read the original to confirm its current state.",
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "description": "Exclusive sequence cursor.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0,
+              "default": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum scanned rows.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Ordered page.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventPage"
+                },
+                "example": {
+                  "events": [],
+                  "next_cursor": "14"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer credential.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient role, program grant or origin permission.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "421": {
+            "description": "HTTP Host does not match the configured gateway origin.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid parameters, command body or idempotency key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Gateway or original provider temporarily unavailable. Recover against the original identifiers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "externalDocs": {
+          "description": "Delivery signatures and acknowledgments",
+          "url": "./gateway-webhooks.md"
+        }
+      }
+    },
+    "/v1/routes/{route}/accounts/{providerAccount}/payouts/{id}": {
+      "get": {
+        "operationId": "getRoutedPayout",
+        "summary": "Read one independently sourced payout",
+        "description": "Merchant, finance or reviewer scope. Native payout IDs can repeat at different processors. This path requires the exact route and upstream account. Bank-return and late ambiguity flags supplement the original close decision. See gateway-finance.md for journal, source import and close workflows.",
+        "parameters": [
+          {
+            "name": "route",
+            "in": "path",
+            "required": true,
+            "description": "Pinned acquiring route.",
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          },
+          {
+            "name": "providerAccount",
+            "in": "path",
+            "required": true,
+            "description": "Upstream account on that route.",
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Native payout identifier.",
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Source manifest, matching status and independent close trail.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoutedPayout"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/BearerRequired"
+          },
+          "403": {
+            "$ref": "#/components/responses/InsufficientAuthority"
+          },
+          "421": {
+            "$ref": "#/components/responses/MisdirectedRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/UnknownFinancialRecord"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictingFinancialEvidence"
+          },
+          "422": {
+            "$ref": "#/components/responses/InvalidPayoutIdentity"
+          },
+          "500": {
+            "$ref": "#/components/responses/FinancialOperationFailed"
+          }
+        },
+        "externalDocs": {
+          "description": "Settlement, journal, independent source imports and approvals",
+          "url": "./gateway-finance.md"
+        }
+      }
+    },
+    "/v2/settlement-fee-corrections": {
+      "post": {
+        "operationId": "stageSignedFeeCorrection",
+        "summary": "Stage one signed correction to a booked fee",
+        "description": "Submits a distinct single-line correction payout. Stage does not post money or issue a confirmed export. Requires exact original payment, fee allocation and eligible close. A replay of identical terms returns the existing corrected payout.",
+        "security": [
+          {
+            "statementBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SignedFeeCorrection"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "A separate correction payout is awaiting bank matching and approval.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoutedPayout"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "An authorized replay returns the current payout.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoutedPayout"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Expected a single strict typed JSON object.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/BearerRequired"
+          },
+          "403": {
+            "$ref": "#/components/responses/InsufficientAuthority"
+          },
+          "404": {
+            "description": "An original operation or payout cannot be resolved within scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictingFinancialEvidence"
+          },
+          "413": {
+            "description": "Correction envelope exceeds 256 KiB.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "421": {
+            "$ref": "#/components/responses/MisdirectedRequest"
+          },
+          "422": {
+            "description": "The signed correction terms are invalid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/FinancialOperationFailed"
+          }
+        }
+      }
+    },
+    "/v2/routes/{route}/accounts/{providerAccount}/payouts/{id}/confirmed-fee-correction": {
+      "get": {
+        "operationId": "getConfirmedFeeCorrection",
+        "summary": "Read a bank-confirmed approved fee correction",
+        "description": "Use the corrected payout ID in its pinned acquiring route and upstream account. Available to a merchant, finance user or reviewer in that merchant book. Rechecks bank evidence and close eligibility at read time.",
+        "parameters": [
+          {
+            "name": "route",
+            "in": "path",
+            "required": true,
+            "description": "Pinned acquiring route.",
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          },
+          {
+            "name": "providerAccount",
+            "in": "path",
+            "required": true,
+            "description": "Upstream account on that route.",
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Native payout identifier.",
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A current eligible fee posting. Repeated reads return the same posting identity.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfirmedFeeCorrection"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/BearerRequired"
+          },
+          "403": {
+            "$ref": "#/components/responses/InsufficientAuthority"
+          },
+          "404": {
+            "$ref": "#/components/responses/UnknownFinancialRecord"
+          },
+          "409": {
+            "description": "Bank matching, approval or current evidence is insufficient or contradictory.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "421": {
+            "$ref": "#/components/responses/MisdirectedRequest"
+          },
+          "422": {
+            "$ref": "#/components/responses/InvalidPayoutIdentity"
+          },
+          "500": {
+            "$ref": "#/components/responses/FinancialOperationFailed"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "merchantBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "One case-sensitive Bearer credential for the merchant program, obtained out of band. The gateway requires 32\u2013256 token bytes. Financial reads also accept finance or reviewer credentials within the same merchant program."
+      },
+      "statementBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Statement credential for the exact merchant, processor route and upstream account. Its configured fee_correction_keys map binds key IDs to raw Ed25519 public keys encoded as 64 lowercase hexadecimal characters."
+      }
+    },
+    "parameters": {
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": true,
+        "description": "Exactly one persistent merchant request key. Reuse it with the original economic terms after a timeout or lost response.",
+        "schema": {
+          "$ref": "#/components/schemas/Identifier"
+        }
+      },
+      "OriginalID": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "Original gateway identifier returned by the create operation.",
+        "schema": {
+          "$ref": "#/components/schemas/Identifier"
+        }
+      }
+    },
+    "schemas": {
+      "Identifier": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+      },
+      "Currency": {
+        "type": "string",
+        "pattern": "^[A-Z]{3}$"
+      },
+      "PositiveMinor": {
+        "type": "integer",
+        "format": "int64",
+        "minimum": 1,
+        "maximum": 9000000000000000
+      },
+      "Method": {
+        "type": "string",
+        "enum": [
+          "card",
+          "visa",
+          "mastercard",
+          "amex",
+          "wechat_pay",
+          "alipay"
+        ]
+      },
+      "Channel": {
+        "type": "string",
+        "enum": [
+          "hosted",
+          "terminal"
+        ]
+      },
+      "Status": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "pending",
+          "unknown",
+          "review",
+          "captured",
+          "refunded",
+          "declined"
+        ]
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "CreateIntent": {
+        "type": "object",
+        "properties": {
+          "payment_method": {
+            "$ref": "#/components/schemas/Method",
+            "description": "Omit for the default card route in aggregate mode. Discover availability before presenting the option."
+          },
+          "order_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "allocation_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "outlet_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "terminal_id": {
+            "type": "string",
+            "pattern": "^([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})?$",
+            "description": "Required and nonempty on terminal, omit on hosted."
+          },
+          "channel": {
+            "$ref": "#/components/schemas/Channel"
+          },
+          "amount_minor": {
+            "$ref": "#/components/schemas/PositiveMinor"
+          },
+          "currency": {
+            "$ref": "#/components/schemas/Currency"
+          },
+          "quote_version": {
+            "$ref": "#/components/schemas/Identifier",
+            "default": "1"
+          },
+          "order_total_minor": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9000000000000000,
+            "description": "Defaults to amount_minor when omitted or zero. Must cover this allocation and stay constant across split tenders."
+          },
+          "replaces_id": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Previous operation on the same allocation. Replacement requires a definitive unpaid decline."
+          }
+        },
+        "required": [
+          "order_id",
+          "allocation_id",
+          "outlet_id",
+          "channel",
+          "amount_minor",
+          "currency"
+        ],
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "channel": {
+                  "const": "terminal"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "terminal_id"
+              ],
+              "properties": {
+                "terminal_id": {
+                  "minLength": 1
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "terminal_id": {
+                  "const": ""
+                }
+              }
+            }
+          }
+        ]
+      },
+      "CreateRefund": {
+        "type": "object",
+        "properties": {
+          "amount_minor": {
+            "$ref": "#/components/schemas/PositiveMinor"
+          },
+          "merchant_refund_id": {
+            "$ref": "#/components/schemas/Identifier"
+          }
+        },
+        "required": [
+          "amount_minor",
+          "merchant_refund_id"
+        ],
+        "additionalProperties": false
+      },
+      "Operation": {
+        "type": "object",
+        "properties": {
+          "payment_method": {
+            "$ref": "#/components/schemas/Method"
+          },
+          "route_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "connector_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "provider_account": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "card_brand": {
+            "type": "string"
+          },
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "operation_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "merchant_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "processor_account": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "charge",
+              "refund"
+            ]
+          },
+          "parent_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "order_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "allocation_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "quote_version": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "outlet_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "terminal_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "channel": {
+            "$ref": "#/components/schemas/Channel"
+          },
+          "amount_minor": {
+            "$ref": "#/components/schemas/PositiveMinor"
+          },
+          "currency": {
+            "$ref": "#/components/schemas/Currency"
+          },
+          "status": {
+            "$ref": "#/components/schemas/Status"
+          },
+          "reference": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "checkout_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Scoped buyer URL for pending hosted checkout. Retain it as a secret and accept only the enrolled checkout origin."
+          },
+          "merchant_refund_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "refunded_minor": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reserved_refund_minor": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reason": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "operation_id",
+          "merchant_id",
+          "processor_account",
+          "kind",
+          "order_id",
+          "allocation_id",
+          "quote_version",
+          "outlet_id",
+          "channel",
+          "amount_minor",
+          "currency",
+          "status",
+          "refunded_minor",
+          "reserved_refund_minor",
+          "version",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "Event": {
+        "type": "object",
+        "properties": {
+          "payment_method": {
+            "$ref": "#/components/schemas/Method"
+          },
+          "route_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "connector_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "provider_account": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "card_brand": {
+            "type": "string"
+          },
+          "reference": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "refunded_minor": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reserved_refund_minor": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "sequence": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "operation_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "parent_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "outlet_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "processor_account": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "charge",
+              "refund"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/Status"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "amount_minor": {
+            "$ref": "#/components/schemas/PositiveMinor"
+          },
+          "currency": {
+            "$ref": "#/components/schemas/Currency"
+          },
+          "recorded_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "refunded_minor",
+          "reserved_refund_minor",
+          "sequence",
+          "operation_id",
+          "outlet_id",
+          "processor_account",
+          "kind",
+          "status",
+          "version",
+          "amount_minor",
+          "currency",
+          "recorded_at"
+        ]
+      },
+      "ReleaseEvidence": {
+        "type": "object",
+        "properties": {
+          "payment": {
+            "$ref": "#/components/schemas/Operation"
+          },
+          "release_eligible": {
+            "type": "boolean"
+          },
+          "complete": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "processor_observed_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "gateway_observed_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "processor_capture_reference": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "processor_refunded_minor": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reserved_refund_minor": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "dispute_status": {
+            "type": "string",
+            "enum": [
+              "none",
+              "open",
+              "lost",
+              "won",
+              "pending",
+              "unknown"
+            ]
+          },
+          "financial_exception": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "payment",
+          "release_eligible",
+          "complete",
+          "reason",
+          "gateway_observed_at",
+          "processor_refunded_minor",
+          "reserved_refund_minor",
+          "dispute_status",
+          "financial_exception"
+        ]
+      },
+      "EventPage": {
+        "type": "object",
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Event"
+            }
+          },
+          "next_cursor": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          }
+        },
+        "required": [
+          "events",
+          "next_cursor"
+        ]
+      },
+      "Methods": {
+        "type": "object",
+        "properties": {
+          "currency": {
+            "$ref": "#/components/schemas/Currency"
+          },
+          "channel": {
+            "$ref": "#/components/schemas/Channel"
+          },
+          "methods": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Method"
+            }
+          }
+        },
+        "required": [
+          "currency",
+          "channel",
+          "methods"
+        ]
+      },
+      "StatementLine": {
+        "type": "object",
+        "properties": {
+          "line_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "capture",
+              "refund",
+              "fee",
+              "fee_rebate",
+              "chargeback",
+              "chargeback_reversal",
+              "source_refund",
+              "additional_capture",
+              "refund_excess_capture",
+              "return_recredit",
+              "fee_correction"
+            ]
+          },
+          "reference": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "parent_reference": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "amount_minor": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "line_id",
+          "kind",
+          "reference",
+          "amount_minor"
+        ]
+      },
+      "RoutedPayout": {
+        "type": "object",
+        "properties": {
+          "route_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "provider_account": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "payout_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "bank_trace": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "beneficiary": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "currency": {
+            "$ref": "#/components/schemas/Currency"
+          },
+          "net_minor": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "source_digest": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StatementLine"
+            }
+          },
+          "merchant_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "processor_account": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "imported_by": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "imported_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "in_transit",
+              "zero_net",
+              "prepared",
+              "matched",
+              "closed_zero_net",
+              "awaiting_bank"
+            ]
+          },
+          "exception_ids": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          },
+          "open_exceptions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          },
+          "funding_match_ambiguous": {
+            "type": "boolean"
+          },
+          "returned_minor": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "processor_recredit_minor": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "proposal_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "bank_entry_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "prepared_by": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "prepared_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "approved_by": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "approved_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "fee_correction": {
+            "$ref": "#/components/schemas/BookedFeeCorrection"
+          }
+        },
+        "required": [
+          "route_id",
+          "provider_account",
+          "payout_id",
+          "bank_trace",
+          "beneficiary",
+          "currency",
+          "net_minor",
+          "source_digest",
+          "lines",
+          "merchant_id",
+          "processor_account",
+          "imported_by",
+          "imported_at",
+          "status"
+        ]
+      },
+      "SHA256Digest": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
+      },
+      "FeeCorrectionTerms": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "route_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "provider_account": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "source_subject": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "merchant_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "processor_account": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "currency": {
+            "$ref": "#/components/schemas/Currency"
+          },
+          "beneficiary": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "connector_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "operation_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "order_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "allocation_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "capture_reference": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "original_payout_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "original_proposal_id": {
+            "$ref": "#/components/schemas/SHA256Digest"
+          },
+          "original_source_digest": {
+            "$ref": "#/components/schemas/SHA256Digest"
+          },
+          "original_line_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "original_fee_reference": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "original_fee_minor": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": -9223372036854775807,
+            "maximum": -1
+          },
+          "correction_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "corrected_payout_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "bank_trace": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "source_digest": {
+            "$ref": "#/components/schemas/SHA256Digest"
+          },
+          "delta_minor": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": -9223372036854775807,
+            "maximum": 9223372036854775807,
+            "not": {
+              "const": 0
+            }
+          }
+        },
+        "required": [
+          "route_id",
+          "provider_account",
+          "source_subject",
+          "merchant_id",
+          "processor_account",
+          "currency",
+          "beneficiary",
+          "connector_id",
+          "operation_id",
+          "order_id",
+          "allocation_id",
+          "capture_reference",
+          "original_payout_id",
+          "original_proposal_id",
+          "original_source_digest",
+          "original_line_id",
+          "original_fee_reference",
+          "original_fee_minor",
+          "correction_id",
+          "corrected_payout_id",
+          "bank_trace",
+          "source_digest",
+          "delta_minor"
+        ],
+        "description": "Original booked fee and signed change in minor units. The sum of original_fee_minor and delta_minor must fit the supported range and be at most zero. The corrected payout, bank trace and processor source digest must differ from the original settlement."
+      },
+      "SignedFeeCorrection": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "key_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$"
+          },
+          "terms": {
+            "$ref": "#/components/schemas/FeeCorrectionTerms"
+          },
+          "signature": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{128}$"
+          }
+        },
+        "required": [
+          "key_id",
+          "terms",
+          "signature"
+        ],
+        "description": "Sign with Ed25519 over the UTF-8 prefix dakimpay/settlement-fee-correction/1 followed by a single LF byte (0x0a), then compact UTF-8 JSON containing key_id and terms in that order. Within terms, serialize the fields in the order specified by the required array in FeeCorrectionTerms. Use ordinary base-10 integer tokens, no whitespace, no trailing newline, unescaped ASCII identifiers. Submit the 64-byte signature as 128 lowercase hex characters. The gateway reconstructs the signed bytes from strict typed input. Duplicated, unknown and null fields are rejected."
+      },
+      "BookedFeeCorrection": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "envelope": {
+            "$ref": "#/components/schemas/SignedFeeCorrection"
+          },
+          "public_key": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "required": [
+          "envelope",
+          "public_key"
+        ],
+        "description": "Archived submitted envelope and public key selected by the gateway at admission."
+      },
+      "ConfirmedFeeCorrection": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "schema": {
+            "type": "string",
+            "const": "dakimpay.confirmed_fee_correction.v1"
+          },
+          "posting_id": {
+            "$ref": "#/components/schemas/SHA256Digest"
+          },
+          "terms": {
+            "$ref": "#/components/schemas/FeeCorrectionTerms"
+          },
+          "revised_fee_minor": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": -9223372036854775807,
+            "maximum": 0
+          },
+          "payment_method": {
+            "$ref": "#/components/schemas/Method"
+          },
+          "card_brand": {
+            "type": "string"
+          },
+          "processor_ledger": {
+            "$ref": "#/components/schemas/SHA256Digest"
+          },
+          "original_bank_entry_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "bank_entry_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "bank_source_digest": {
+            "$ref": "#/components/schemas/SHA256Digest"
+          },
+          "proposal_id": {
+            "$ref": "#/components/schemas/SHA256Digest"
+          },
+          "prepared_by": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "approved_by": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "approved_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "journal_sequence": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          }
+        },
+        "required": [
+          "schema",
+          "posting_id",
+          "terms",
+          "revised_fee_minor",
+          "payment_method",
+          "processor_ledger",
+          "original_bank_entry_id",
+          "bank_entry_id",
+          "bank_source_digest",
+          "proposal_id",
+          "prepared_by",
+          "approved_by",
+          "approved_at",
+          "journal_sequence"
+        ],
+        "description": "One eligible merchant fee posting; deduplicate by posting_id. The order and tender allocation identify the existing purchase. An export represents a signed fee change and does not create another retail receipt."
+      }
+    },
+    "responses": {
+      "BearerRequired": {
+        "description": "Missing or invalid bearer credential.",
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "InsufficientAuthority": {
+        "description": "Insufficient role, program grant or origin permission.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          },
+          "text/plain": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "UnknownFinancialRecord": {
+        "description": "Original missing or inaccessible within this merchant program.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "ConflictingFinancialEvidence": {
+        "description": "Conflicting original terms, allocation, reservation, suspension or financial evidence.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "MisdirectedRequest": {
+        "description": "HTTP Host does not match the configured gateway origin.",
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "InvalidPayoutIdentity": {
+        "description": "Malformed route, provider account or native payout identifier.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "FinancialOperationFailed": {
+        "description": "Internal financial operation failed.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    }
+  }
+}

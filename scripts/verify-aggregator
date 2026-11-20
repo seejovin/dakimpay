@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""Run independent provider, charge recovery and routed settlement acceptance on real local processes."""
+import argparse
+from collections import defaultdict
+from contextlib import ExitStack
+import hashlib
+import json
+import os
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import tempfile
+from urllib.parse import urlsplit
+
+from aggregator_fixture import PORTS, PROVIDERS
+
+HERE = Path(__file__).resolve().parent
+common = runpy.run_path(str(HERE / "verify-gateway"))
+Endpoint, wait, require = (common[name] for name in ("Endpoint", "wait", "require"))
+
+
+class Exercise:
+    def __init__(self, state, settings, local):
+        fixture = json.loads((state / "clients.json").read_text())
+        self.state, self.settings, self.local = state, settings, local
+        self.gateway = Endpoint(fixture["gateway_url"])
+        self.m, self.other = fixture["merchants"]
+        self.providers = fixture["providers"]
+        self.expected = defaultdict(list)
+        self.sales = {}
+        self.statements = {}
+
+    def merchant(self, path, **options):
+        return self.gateway.request(path, token=self.m["tokens"]["merchant"], **options)
+
+    def endpoint(self, route):
+        return Endpoint(self.providers[route]["origin"])
+
+    def bound(self, value, route, method):
+        acct = self.providers[route]["merchants"][self.m["merchant"]]["provider_account"]
+        require((value["route_id"], value["connector_id"], value["provider_account"], value["payment_method"])
+                == (route, route, acct, method), "Merchant response lost its original provider binding")
+        require(value["processor_account"] == self.m["account"], "Gateway account replaced by provider account")
+
+    def initiate(self, tag, route, method, amount, channel="hosted"):
+        body = {"order_id": tag, "allocation_id": "first", "outlet_id": self.m["outlet"],
+                "channel": channel, "currency": "USD", "amount_minor": amount, "payment_method": method}
+        if channel == "terminal":
+            body["terminal_id"] = self.m["terminal"]
+        key = "request-" + tag
+        value = self.merchant("/v2/payment-intents", data=body, key=key, codes=(201,))
+        self.bound(value, route, method)
+        same = self.merchant("/v2/payment-intents", data=body, key=key)
+        require(same["id"] == value["id"], "Repeated create allocated another original")
+        path = "/v2/payment-intents/" + value["id"]
+        self.gateway.request(path, token=self.other["tokens"]["merchant"], codes=(404,))
+        pending = wait("independent provider presentment", lambda: self.at(path, "pending"))
+        self.bound(pending, route, method)
+        self.sales[tag] = {"id": value["id"], "path": path, "body": body, "key": key, "route": route, "pending": pending}
+        return self.sales[tag]
+
+    def at(self, path, status):
+        data = self.merchant(path)
+        if data["status"] in ("declined", "review") and status not in ("declined", "review"):
+            raise AssertionError(f"{path} entered {data['status']}: {data.get('reason', '')}")
+        return data if data["status"] == status else None
+
+    def decide(self, sale):
+        route, body, pending = sale["route"], sale["body"], sale["pending"]
+        proc = self.endpoint(route)
+        if body["channel"] == "terminal":
+            device = self.m["device_token"]
+            present = proc.request("/device/v1/command", token=device)
+            require(present["command"]["operation_id"] == sale["id"], "Mismatched terminal transaction")
+            action = "/device/v1/commands/" + sale["id"] + "/decision"
+            for _ in range(2):
+                proc.request(action, token=device, data={"decision": "approve"})
+            return
+        u = urlsplit(pending["checkout_url"])
+        require(f"{u.scheme}://{u.netloc}" == proc.origin and u.path.startswith("/checkout/") and not u.query,
+                "Hosted URL does not belong to pinned provider")
+        page = proc.request(u.path, text=True)
+        wallet = body["payment_method"] in ("wechat_pay", "alipay")
+        if wallet:
+            action = u.path.replace("/checkout/", "/wallet/", 1)
+            require(action in page, "Wallet presentment omitted its wallet handoff")
+            if body["payment_method"] == "wechat_pay":
+                qr = proc.request(u.path + "/qr.png", raw_bytes=True)
+                require(qr.startswith(b"\x89PNG\r\n\x1a\n"), "WeChat Pay virtual QR image missing")
+            proc.request(action, text=True)
+            decision = {"decision": "approve"}
+        else:
+            action = u.path
+            wrong_brand = "amex" if body["payment_method"] == "visa" else "visa"
+            proc.request(action, data={"decision": "approve", "card_brand": wrong_brand}, form=True, text=True, codes=(422,))
+            decision = {"decision": "approve", "card_brand": body["payment_method"]}
+        for _ in range(2):
+            proc.request(action, data=decision, form=True, text=True)
+
+    def captured(self, sale):
+        body = sale["body"]
+        item = wait("verified gateway capture", lambda: self.at(sale["path"], "captured"))
+        self.bound(item, sale["route"], body["payment_method"])
+        if body["payment_method"] in ("amex", "mastercard", "visa"):
+            require(item["card_brand"] == body["payment_method"], "Observed card brand did not match requested brand")
+        proof = self.merchant(sale["path"] + "/release-evidence")
+        require(proof["complete"] and proof["release_eligible"], "Capture lacked fresh release evidence")
+        self.expected[sale["route"]].append((item["operation_id"], item["reference"], "capture", body["amount_minor"]))
+
+    def refund(self, sale, amount):
+        route, method = sale["route"], sale["body"]["payment_method"]
+        key = "rf-" + sale["id"]
+        body = {"merchant_refund_id": key, "amount_minor": amount}
+        path = sale["path"] + "/refunds"
+        first = self.merchant(path, data=body, key=key, codes=(201,))
+        same = self.merchant(path, data=body, key=key)
+        require(same["id"] == first["id"], "Refund replay created a second instruction")
+        item = wait("refund at original provider", lambda: self.at("/v2/refunds/" + first["id"], "refunded"))
+        self.bound(item, route, method)
+        require(item["parent_id"] == sale["id"], "Refund lost its original payment")
+        proof = self.merchant(sale["path"] + "/release-evidence")
+        require(proof["complete"] and not proof["release_eligible"] and proof["processor_refunded_minor"] == amount,
+                "Refunded original still allowed first fulfilment")
+        self.expected[route].append((item["operation_id"], item["reference"], "refund", -amount))
+
+    def records(self, route):
+        exe = Path(os.environ["DAKIM_PG_BIN"]) / "psql" if os.getenv("DAKIM_PG_BIN") else shutil.which("psql")
+        if not exe:
+            exe = Path(subprocess.check_output(["pg_config", "--bindir"], text=True).strip()) / "psql"
+        keys = json.loads((self.state / "provisioning.json").read_text())
+        name = "dg_" + route.replace("-", "_")
+        proc = subprocess.run([exe, "-XqAtw", "-v", "ON_ERROR_STOP=1", "-U", name, "-d", name,
+                               "-p", str(self.settings["postgres"]), "-h", "127.0.0.1", "-c",
+                               "SELECT operation_id,reference,kind,amount FROM virtualrail.movement"],
+                              check=True, capture_output=True, text=True,
+                              env={**os.environ, "PGPASSWORD": keys["db"][route],
+                                   "PGOPTIONS": "-c default_transaction_read_only=on"})
+        return sorted((op, ref, kind, int(amt)) for op, ref, kind, amt in (x.split("|") for x in proc.stdout.splitlines()))
+
+    def exercise_recovery(self):
+        primary = self.initiate("ambiguous-card", "card-primary", "visa", 1234)
+        self.local("stop-gateway")
+        self.decide(primary)
+        self.local("stop-provider", "card-primary")
+        self.local("start-gateway")
+        controls = "/v2/program/routes/card-primary/sales"
+        key = "merchant-suspends-primary"
+        reason = {"reason": "Original capturing provider unavailable during qualification"}
+        self.merchant(controls + "/freeze", data=reason, key=key, codes=(403,))
+        receipt = self.gateway.request(controls + "/freeze", token=self.m["tokens"]["finance"], key=key, data=reason)
+        require(receipt["route_id"] == "card-primary" and self.merchant(controls)["suspended"], "Scoped route freeze failed")
+        require(not self.gateway.request(controls, token=self.other["tokens"]["merchant"])["suspended"],
+                "One merchant's route suspension interrupted a different merchant")
+        methods = "/v2/payment-methods?channel=terminal&amount_minor=100"
+        require(not self.merchant(methods)["methods"], "Suspended merchant still advertised its terminal route")
+        require("visa" in self.gateway.request(methods, token=self.other["tokens"]["merchant"])["methods"],
+                "Another merchant lost its terminal enrollment")
+        replay = self.merchant("/v2/payment-intents", data=primary["body"], key=primary["key"])
+        require(replay["id"] == primary["id"] and replay["route_id"] == "card-primary", "Ambiguous sale rerouted")
+        self.merchant("/v2/payment-intents", data=primary["body"], key="new-key-old-economic-order", codes=(409,))
+        # A new order can use the alternate. Recovery of the original never may.
+        alternate = self.initiate("new-visa", "card-secondary", "visa", 501)
+        self.decide(alternate)
+        self.captured(alternate)
+        require([r[0] for r in self.records("card-secondary")] == [alternate["id"]], "Backup collected the original")
+        self.local("start-provider", "card-primary")
+        self.captured(primary)
+        self.refund(primary, 234)
+        version = self.merchant(controls)["suspension_version"]
+        proposal = self.gateway.request(controls + "/resume-proposals", token=self.m["tokens"]["finance"],
+                                        key="propose-primary", data={"reason": "Provider reconciled", "suspension_version": version})
+        approval = {k: proposal[k] for k in ("proposal_id", "proposal_digest", "suspension_version")}
+        self.gateway.request(controls + "/resume-approvals", token=self.m["tokens"]["finance"], key="approve", data=approval, codes=(403,))
+        self.gateway.request(controls + "/resume-approvals", token=self.m["tokens"]["reviewer"], key="approve", data=approval)
+        require(not self.merchant(controls)["suspended"], "Authorized independent reviewer could not resume original route")
+        print("PASS capture with gateway down, original provider outage, primary suspended: an independent new order used the alternate; the original capture and refund stayed pinned", flush=True)
+
+    def finance(self, route, expected_net):
+        cfg = self.providers[route]["merchants"][self.m["merchant"]]
+        payout = "daily-001"
+        rp = "/rail/v1/remittances/" + payout
+        proc = self.endpoint(route)
+        report = proc.request(rp, token=cfg["statement_token"], method="POST", codes=(201,))
+        require(proc.request(rp, token=cfg["statement_token"]) == report, "Frozen source report changed")
+        raw = proc.request(rp + "/source", token=cfg["statement_token"], raw_bytes=True)
+        require(hashlib.sha256(raw).hexdigest() == report["source_digest"], "Source evidence digest mismatch")
+        require(report["route_id"] == route and report["provider_account"] == cfg["provider_account"]
+                and report["net_minor"] == expected_net, "Report funding or source identity differs from expected")
+        movements = sorted((r["operation_id"], r["reference"], r["kind"], r["amount_minor"]) for r in json.loads(raw)["movements"])
+        require(movements == sorted(self.expected[route]) == self.records(route), "Independent movements differ")
+        other = next(p for p in PROVIDERS if p != route)
+        wrong = self.providers[other]["merchants"][self.m["merchant"]]["import_token"]
+        self.gateway.request("/v1/settlement-statements", token=wrong, data=report, codes=(403,))
+        self.gateway.request("/v1/settlement-statements", token=cfg["import_token"], data=report, codes=(201,))
+        self.gateway.request("/v1/settlement-statements", token=cfg["import_token"], data=report)
+        pp = f"/v1/routes/{route}/accounts/{cfg['provider_account']}/payouts/{payout}"
+        scoped = self.merchant(pp)
+        require(scoped["status"] == "in_transit", "Missing independently booked bank evidence was accepted")
+        bank_id = "bank-entry-" + route
+        bank = {"entry_id": bank_id, "bank_trace": report["bank_trace"], "beneficiary": self.m["beneficiary"],
+                "currency": self.m["currency"], "amount_minor": expected_net}
+        bank["source_digest"] = hashlib.sha256(json.dumps(bank, sort_keys=True).encode()).hexdigest()
+        def api(role, path, data, codes=(200,)):
+            return self.gateway.request(path, data=data, token=self.m["tokens"][role], codes=codes)
+        api("bank", "/v1/bank-entries", bank, (201,))
+        proposal = api("finance", pp + "/prepare-close", {"bank_entry_id": bank_id})
+        closed = api("reviewer", pp + "/approve-close", {"proposal_id": proposal["proposal_id"]})
+        require(closed["status"] == "matched", "Four-eyes routed payout close failed")
+        self.statements[route] = (report["bank_trace"], expected_net)
+
+    def run(self):
+        catalog = "/v2/payment-methods?channel="
+        hosted = self.merchant(catalog + "hosted&amount_minor=100")
+        card = {"card", "visa", "mastercard", "amex"}
+        require(set(hosted["methods"]) == card | {"wechat_pay", "alipay"}, "Incomplete hosted capabilities")
+        require(set(self.merchant(catalog + "terminal&amount_minor=100")["methods"]) == card,
+                "Terminal advertised a method without an enrolled reader")
+        invalid = {"order_id": "unknown", "allocation_id": "one", "channel": "hosted", "outlet_id": self.m["outlet"],
+                   "currency": "USD", "amount_minor": 100, "payment_method": "unsupported"}
+        self.merchant("/v2/payment-intents", data=invalid, key="unsupported", codes=(422,))
+        for tag, route, method, amount, channel in (
+                ("mastercard", "card-primary", "mastercard", 350, "hosted"),
+                ("amex", "card-primary", "amex", 300, "terminal"),
+                ("wechat", "wechat", "wechat_pay", 400, "hosted"),
+                ("alipay", "alipay", "alipay", 600, "hosted")):
+            sale = self.initiate(tag, route, method, amount, channel)
+            self.decide(sale)
+            self.captured(sale)
+        self.refund(self.sales["wechat"], 100)
+        self.refund(self.sales["alipay"], 75)
+        self.exercise_recovery()
+        for route, net in (("card-primary", 1604), ("card-secondary", 488), ("wechat", 290), ("alipay", 510)):
+            self.finance(route, net)
+        self.merchant("/v1/payouts/daily-001", codes=(404,))
+        require(len({v[0] for v in self.statements.values()}) == 4, "Different sources shared bank traces")
+        print("PASS four isolated provider databases: six original captures, three linked refunds, four independently traced and matched daily-001 payouts totaling USD 28.92", flush=True)
+
+
+def main():
+    args = argparse.ArgumentParser(description=__doc__)
+    mode = args.add_mutually_exclusive_group()
+    mode.add_argument("--concurrency", action="store_true", help="Race duplicate creates and refunds across four real local providers.")
+    mode.add_argument("--browser", action="store_true", help="Run real Chromium merchant and wallet checkout journeys.")
+    options = args.parse_args()
+    with ExitStack() as stack:
+        state = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="dakim-aggregate-")))
+        amounts = common["free_ports"](6)
+        env = {**os.environ, "DAKIM_GATEWAY_STATE": str(state), "DAKIM_GATEWAY_PORT": str(amounts[0]),
+               "DAKIM_GATEWAY_PG_PORT": str(amounts[1])}
+        for (_, key, _), port in zip(PORTS, amounts[2:]):
+            env[key] = str(port)
+        def local(*action):
+            proc = subprocess.run([HERE / "aggregator-local", *action], env=env, stdout=subprocess.DEVNULL)
+            if proc.returncode:
+                for log in sorted(state.glob("*.log")):
+                    if log.name != "postgres.log":
+                        print(log.name, log.read_text()[-650:], flush=True)
+                proc.check_returncode()
+        stack.callback(local, "stop")
+        local("start")
+        if options.browser:
+            subprocess.run(["node", HERE / "aggregator_browser.cjs"], env=env, check=True)
+        else:
+            test = Exercise(state, json.loads((state / "binding.json").read_text()), local)
+            if options.concurrency:
+                from aggregator_concurrency import verify
+                verify(test, wait, require)
+            else:
+                test.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{if .MethodName}}{{.MethodName}} · {{end}}Hosted checkout · dakim pay</title><link rel="stylesheet" href="/terminal.css"></head>
+<body><header><strong>dakim<span> pay</span></strong><span class="mode">{{if .WalletScreen}}Virtual wallet{{else}}Virtual checkout{{end}}</span></header><main><section class="panel">
+<p class="label">{{if eq .State "pending"}}Amount due{{else if eq .State "captured"}}Payment approved{{else}}Payment declined{{end}}</p><h1>{{.Amount}}</h1>
+<dl><dt>Merchant</dt><dd>{{.Merchant}}</dd><dt>Order</dt><dd>{{.Order}}</dd>{{if .MethodName}}<dt>Payment method</dt><dd>{{.MethodName}}</dd>{{end}}{{if .Brand}}<dt>Test card used</dt><dd>{{.Brand}}</dd>{{end}}{{if .Reference}}<dt>Processor reference</dt><dd>{{.Reference}}</dd>{{end}}</dl>
+{{if eq .State "pending"}}
+{{if and .Wallet (not .WalletScreen)}}
+{{if eq .Method "wechat_pay"}}<img width="240" height="240" src="{{.QRURL}}" alt="QR code for the local simulated WeChat Pay wallet">{{end}}
+<p><a class="wallet-open" href="{{.WalletURL}}">Open simulated {{.MethodName}} wallet</a></p>
+{{else}}
+<form method="post" class="actions">{{if eq .Method "card"}}<label for="card">Test card</label><select name="card_brand" id="card"><option value="visa">Visa</option><option value="mastercard">Mastercard</option><option value="amex">American Express</option></select>{{end}}
+<button type="submit" class="primary" name="decision" value="approve">{{if .WalletScreen}}Approve in virtual wallet{{else}}Approve test payment{{end}}</button><button type="submit" name="decision" value="decline">Decline</button></form>
+{{end}}{{else}}<p>You can return to the merchant.</p>{{end}}</section>
+<p class="foot">{{if .Wallet}}This wallet uses synthetic transactions on this device.{{else}}Synthetic payments only. No card or PIN is required.{{end}}</p></main></body></html>

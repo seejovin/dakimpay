@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+"""Qualify the multi-merchant gateway against a private virtual acquiring program."""
+import argparse
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+import contextlib
+from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import socket
+import subprocess
+import tempfile
+import time
+from urllib.error import HTTPError
+from urllib.parse import urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+import uuid
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+@dataclass
+class Party:
+    merchant: str
+    account: str
+    beneficiary: str
+    currency: str
+    outlet: str
+    terminal: str
+    device_token: str
+    rail_statement_token: str
+    tokens: dict
+
+
+def require(condition, message):
+    if not condition:
+        raise AssertionError(message)
+
+
+def origin_of(url):
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+class Endpoint:
+    def __init__(self, origin):
+        parsed = urlsplit(origin)
+        if parsed.scheme != 'http' or parsed.hostname != '127.0.0.1' or parsed.username is not None or parsed.path:
+            raise ValueError("Verification requires a private virtual fixture on loopback.")
+        self.origin = origin
+
+    def request(self, path, *, token=None, key=None, ledger_id=None, data=None, codes=(200,), form=False, text=False, method=None, raw_bytes=False):
+        headers = {}
+        body = None
+        if token:
+            headers['Authorization'] = 'Bearer ' + token
+        if key:
+            headers['Idempotency-Key'] = key
+        if ledger_id:
+            headers['Dakim-Processor-Ledger'] = ledger_id
+        if data is not None:
+            headers['Origin'] = self.origin
+            if form:
+                body = urlencode(data).encode()
+                headers['Content-Type'] = 'application/x-www-form-urlencoded'
+            else:
+                body = json.dumps(data).encode()
+                headers['Content-Type'] = 'application/json'
+        label = '<hosted checkout>' if path.startswith('/checkout/') else path
+        request = Request(self.origin + path, headers=headers, data=body, method=method)
+        try:
+            response = build_opener(ProxyHandler({}), NoRedirect()).open(request, timeout=10)
+        except HTTPError as error:
+            response = error
+        with response:
+            status = response.status
+            raw = response.read()
+        if status not in codes:
+            detail = ''
+            try:
+                error = json.loads(raw)
+                if isinstance(error, dict):
+                    detail = error.get('error', '') if isinstance(error.get('error'), str) else ''
+            except ValueError:
+                pass
+            raise AssertionError(f"{request.get_method()} {label}: expected {codes}, received {status}: {detail}")
+        if raw_bytes:
+            return raw
+        if text:
+            return raw.decode()
+        if raw and status < 300:
+            return json.loads(raw)
+        return None
+
+
+def wait(desc, check, timeout=45):
+    deadline = time.monotonic() + timeout
+    while True:
+        result = check()
+        if result:
+            return result
+        if time.monotonic() >= deadline:
+            raise AssertionError('Timed out waiting for ' + desc)
+        time.sleep(0.12)
+
+
+class Verification:
+    def __init__(self, gateway, rail, connector, a, b, restart):
+        self.gateway = Endpoint(gateway)
+        self.rail = Endpoint(rail)
+        self.connector = connector
+        self.a, self.b = a, b
+        self.restart = restart
+        self.tag = 'verify-' + uuid.uuid4().hex[:16]
+        self.operations = []
+        self.ledgers = {}
+
+    def key(self, suffix):
+        return self.tag + '-' + suffix
+
+    def command(self, p, channel, amount, suffix):
+        order = {'order_id': self.key('order-' + suffix), 'allocation_id': self.key('allocation-' + suffix),
+                 'outlet_id': p.outlet, 'channel': channel, 'currency': p.currency, 'amount_minor': amount}
+        if channel == 'terminal':
+            order['terminal_id'] = p.terminal
+        return order
+
+    def merchant(self, p, path, **kwargs):
+        return self.gateway.request(path, token=p.tokens['merchant'], **kwargs)
+
+    def wait_resource(self, p, path, status):
+        def check():
+            obj = self.merchant(p, path)
+            if obj['status'] == status:
+                return obj
+            if obj['status'] in {'review', 'declined'}:
+                raise AssertionError(f"{path} entered {obj['status']} while awaiting {status}")
+        return wait('merchant resource to become ' + status, check)
+
+    def make(self, p, body, key, **kwargs):
+        return self.merchant(p, '/v2/payment-intents', data=body, key=key, **kwargs)
+
+    def device(self, p, path='/device/v1/command', **kwargs):
+        return self.rail.request(path, token=p.device_token, **kwargs)
+
+    def rail_fact(self, p, op):
+        scope = f"/rail/v1/accounts/{p.account}/merchants/{p.merchant}"
+        path = scope + '/operations/' + op
+        if scope not in self.ledgers:
+            identity = self.rail.request(scope + '/identity', token=self.connector)
+            require(identity['merchant_id'] == p.merchant and identity['processor_account'] == p.account
+                    and identity['ledger_id'], 'Source ledger identity differs from the expected program')
+            self.rail.request(path, token=self.connector, codes=(412,))
+            self.ledgers[scope] = identity['ledger_id']
+        return self.rail.request(path, token=self.connector, ledger_id=self.ledgers[scope])
+
+    def verify_terminal(self):
+        a, b = self.a, self.b
+        key = self.key('same-key')
+        order = self.command(a, 'terminal', 1234, 'shared')
+        other_order = self.command(b, 'terminal', 1234, 'shared')
+        def replay(_):
+            return self.make(a, order, key, codes=(200,201))
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            receipts = list(pool.map(replay, range(6)))
+        first = receipts[0]
+        require(len({item['id'] for item in receipts}) == 1, 'Repeated create allocated multiple intents')
+        self.make(a, dict(order, amount_minor=1235), key, codes=(409,))
+        self.make(a, order, self.key('second-key-for-same-allocation'), codes=(409,))
+        other = self.make(b, other_order, key, codes=(201,))
+        require(other['id'] != first['id'], 'Merchants with colliding keys shared an intent')
+        path = '/v2/payment-intents/' + first['id']
+        self.merchant(b, path, codes=(404,))
+        self.gateway.request(path, codes=(401,))
+        self.rail.request('/device/v1/command', token=a.tokens['merchant'], codes=(401,403))
+        original = first['operation_id']
+        other_op = other['operation_id']
+
+        def pending(p, expected):
+            command = self.device(p)
+            require(command['version'] == 1, 'Unexpected reader protocol version')
+            item = command['command']
+            if item:
+                require(item['operation_id'] == expected, 'Reader displayed a different operation')
+                return item
+        original_command = wait('first reader to receive command', lambda: pending(a, original))
+        wait('second reader to receive independent command', lambda: pending(b, other_op))
+        require(original_command['amount_minor'] == 1234 and original_command['merchant_id'] == a.merchant
+                and original_command['terminal_id'] == a.terminal, 'Reader received incorrect payment terms')
+        self.wait_resource(a, path, 'pending')
+        release = path + '/release-evidence'
+        self.merchant(b, release, codes=(404,))
+        before_capture = self.merchant(a, release)
+        require(before_capture['release_eligible'] is False and before_capture['reason'] == 'original_not_captured',
+                'Pending payment authorized release of the basket')
+        decision = f'/device/v1/commands/{original}/decision'
+        self.device(b, decision, data={'decision':'approve'}, codes=(404,))
+        require(self.rail_fact(a, original)['state'] == 'pending', 'Foreign reader changed charge')
+
+        with self.restart():
+            fact = self.device(a, decision, data={'decision':'approve'})
+            duplicate = self.device(a, decision, data={'decision':'approve'})
+            require(fact['state'] == 'captured' and fact['reference'] == duplicate['reference'] and fact['reference'],
+                    'Repeated virtual tap did not preserve the original capture')
+            self.device(a, decision, data={'decision':'decline'}, codes=(409,))
+            require(self.rail_fact(a, original)['reference'] == fact['reference'], 'Provider lookup changed movement')
+        result = self.wait_resource(a, path, 'captured')
+        require(result['reference'] == fact['reference'] and result['amount_minor'] == 1234, 'Recovered capture mismatch')
+        proof = self.merchant(a, release)
+        require(proof['payment']['id'] == first['id'] and proof['complete'] is True and proof['release_eligible'] is True
+                and proof['reason'] == 'verified_capture' and proof['processor_capture_reference'] == fact['reference']
+                and proof['dispute_status'] == 'none' and not proof['financial_exception']
+                and proof['processor_refunded_minor'] == proof['reserved_refund_minor'] == 0
+                and proof['gateway_observed_at'] and proof['processor_observed_at'],
+                'Recovered original capture failed independent basket-release verification')
+        again = self.make(a, order, key, codes=(200,))
+        require(again['id'] == first['id'] and again['reference'] == fact['reference'], 'Create replay lost the original')
+        self.device(b, f'/device/v1/commands/{other_op}/decision', data={'decision':'decline'})
+        denied = self.wait_resource(b, '/v2/payment-intents/' + other['id'], 'declined')
+        require(not denied.get('reference') and self.rail_fact(b, other_op)['state'] == 'declined',
+                'Declined card had a financial movement')
+        self.operations.append(result['operation_id'])
+        print('PASS two merchants reused identical order, allocation and request keys; reader isolation, original capture and independent decline', flush=True)
+        return result, other
+
+    def verify_hosted(self):
+        p = self.a
+        order = self.command(p, 'hosted', 300, 'web')
+        created = self.make(p, order, self.key('hosted'), codes=(201,))
+        path = '/v2/payment-intents/' + created['id']
+        pending = self.wait_resource(p, path, 'pending')
+        url = pending['checkout_url']
+        require(origin_of(url) == self.rail.origin, 'Hosted payment capability left the private virtual rail')
+        checkout_path = urlsplit(url).path
+        require(checkout_path.startswith('/checkout/'), 'Missing hosted checkout capability')
+        require('form' in self.rail.request(checkout_path, text=True).lower(), 'Browser cannot present hosted checkout')
+        require(self.rail_fact(p, created['operation_id'])['state'] == 'pending', 'Viewing checkout captured funds')
+        for _ in range(2):
+            self.rail.request(checkout_path, form=True, data={'decision':'approve'}, text=True)
+        captured = self.wait_resource(p, path, 'captured')
+        require(self.rail_fact(p, created['operation_id'])['reference'] == captured['reference'],
+                'Hosted authorization was not corroborated by the independent rail')
+        self.operations.append(created['operation_id'])
+        print('PASS hosted checkout requires a customer decision and repeating that decision preserves the capture', flush=True)
+        return captured
+
+    def verify_refund(self, sale):
+        a = self.a
+        path = '/v2/payment-intents/' + sale['id']
+        refunds = path + '/refunds'
+        # Race over half of the available amount. Exactly one new reservation fits.
+        def receive(i):
+            rid = self.key('refund-' + str(i))
+            return self.merchant(a, refunds, data={'amount_minor':800,'merchant_refund_id':rid},
+                                 key=rid, codes=(201,409))
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            wins = [o for o in pool.map(receive, (0,1)) if o is not None]
+        require(len(wins) == 1, 'Concurrent refunds claimed excess capacity')
+        accepted = wins[0]
+        ref = self.wait_resource(a, '/v2/refunds/' + accepted['id'], 'refunded')
+        payload = {'amount_minor':800,'merchant_refund_id':ref['merchant_refund_id']}
+        repeat = self.merchant(a, refunds, data=payload, key=ref['merchant_refund_id'], codes=(200,))
+        require(repeat['id'] == ref['id'] and repeat['reference'] == ref['reference'], 'Refund replay changed movement')
+        self.merchant(self.b, '/v2/refunds/' + accepted['id'], codes=(404,))
+        self.merchant(a, refunds, key=self.key('excess'), data={'amount_minor':435,'merchant_refund_id':self.key('extra')},
+                      codes=(409,))
+        charge = self.merchant(a, path)
+        require(charge['refunded_minor'] == 800 and charge['reserved_refund_minor'] == 0, 'Refund capacity leaked')
+        fact = self.rail_fact(a, ref['operation_id'])
+        require(fact['state'] == 'refunded' and fact['reference'] == ref['reference']
+                and fact['parent_id'] == sale['operation_id'], 'Refund missing independent original-charge evidence')
+        proof = self.merchant(a, path + '/release-evidence')
+        require(proof['payment']['id'] == sale['id'] and proof['complete'] is True and proof['release_eligible'] is False
+                and proof['reason'] == 'original_refunded' and proof['processor_capture_reference'] == sale['reference']
+                and proof['processor_refunded_minor'] == 800 and proof['reserved_refund_minor'] == 0,
+                'Partially refunded payment still authorized basket release')
+        self.operations.append(ref['operation_id'])
+        print('PASS simultaneous $8.00 refund requests against a $12.34 sale yielded one refund; extra capacity stayed bounded', flush=True)
+        print('PASS merchant release requires fresh capture evidence and is denied after the original is partly refunded', flush=True)
+        return ref
+
+    def verify_events(self, foreign):
+        own = set(self.operations)
+        cursor, seen = '0', []
+        for _ in range(1000):
+            page = self.merchant(self.a, '/v2/events?' + urlencode({'after':cursor, 'limit':2}))
+            if not page['events']:
+                break
+            require(str(page['next_cursor']) != cursor, 'Event cursor failed to advance')
+            cursor = str(page['next_cursor'])
+            seen.extend(page['events'])
+        else:
+            raise AssertionError('Event feed failed to finish under bounded pagination')
+        seq = [ev['sequence'] for ev in seen]
+        require(seq == list(range(1, len(seq) + 1)), 'Event feed contains a sequence gap or duplicate')
+        by_op = {ev['operation_id']: ev['status'] for ev in seen}
+        require(all(by_op.get(op) in ('refunded','captured') for op in own), 'Missing verified merchant event')
+        require(foreign['operation_id'] not in by_op, 'Foreign operation leaked into event feed')
+        print('PASS paginated merchant event feed preserves order and isolates foreign payment events', flush=True)
+
+    def verify_finance(self, terminal, hosted, refund):
+        p = self.a
+        payout = self.key('payout')
+        bank_id = self.key('bank-entry')
+        payout_path = '/v1/payouts/' + payout
+        def api(role, path, **kw):
+            return self.gateway.request(path, token=p.tokens[role], **kw)
+        def digest(value):
+            return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+        report_path = '/rail/v1/remittances/' + payout
+        self.rail.request(report_path, token=p.device_token, method='POST', codes=(401,403))
+        self.rail.request(report_path, token=p.tokens['merchant'], method='POST', codes=(401,403))
+        statement = self.rail.request(report_path, token=p.rail_statement_token, method='POST', codes=(201,))
+        replay = self.rail.request(report_path, token=p.rail_statement_token, method='POST')
+        report = self.rail.request(report_path, token=p.rail_statement_token)
+        require(statement == replay == report, 'Remittance contents changed on replay')
+        source = self.rail.request(report_path + '/source', token=p.rail_statement_token, raw_bytes=True)
+        require(hashlib.sha256(source).hexdigest() == statement['source_digest'],
+                'Frozen source bytes differ from the reported remittance digest')
+        self.rail.request('/rail/v1/remittances/' + self.key('empty'), method='POST',
+                          token=p.rail_statement_token, codes=(409,))
+        self.rail.request(report_path, token=self.b.rail_statement_token, codes=(404,))
+        amounts = Counter()
+        captures = set()
+        fee_refs = set()
+        fee_by_parent = {}
+        refunds = set()
+        for line in statement['lines']:
+            amount, kind, ref = line['amount_minor'], line['kind'], line['reference']
+            amounts[kind] += amount
+            if kind == 'capture':
+                captures.add((amount,ref))
+            elif kind == 'refund':
+                refunds.add((amount,ref))
+            elif kind == 'fee':
+                fee_refs.add(ref)
+                fee_by_parent[line['parent_reference']] = amount
+        require(captures == {(1234,terminal['reference']),(300,hosted['reference'])}
+                and refunds == {(-800,refund['reference'])}, 'Statement differs from original processor references')
+        require(fee_by_parent == {terminal['reference']:-25, hosted['reference']:-8}, 'Incorrect rounded fees')
+        require(amounts == {'capture':1534,'refund':-800,'fee':-33} and len(statement['lines']) == 5
+                and statement['net_minor'] == 701, 'Frozen processor remittance does not explain its funding')
+        # The bank fixture represents independent testimony. Its expected amount is
+        # fixed by the test contract; it is never copied from the processor report.
+        trace = statement['bank_trace']
+        bank_entry = {'entry_id':bank_id, 'bank_trace':trace, 'beneficiary':p.beneficiary,
+                      'currency':p.currency, 'amount_minor':701}
+        bank_entry['source_digest'] = digest(bank_entry)
+        statement_path, bank_path = '/v1/settlement-statements', '/v1/bank-entries'
+        api('merchant', statement_path, data=statement, codes=(403,))
+        api('bank', statement_path, data=statement, codes=(403,))
+        received = api('statement', statement_path, data=statement, codes=(201,))
+        require(received['status'] == 'in_transit', 'A remittance alone closed a payout')
+        api('statement', statement_path, data=statement, codes=(200,))
+        api('statement', statement_path, data=dict(statement, source_digest=digest('different')), codes=(409,))
+        self.merchant(self.b, payout_path, codes=(404,))
+        api('finance', payout_path + '/prepare-close', data={'bank_entry_id':bank_id}, codes=(409,))
+        api('statement', bank_path, data=bank_entry, codes=(403,))
+        api('bank', bank_path, data=bank_entry, codes=(201,))
+        api('bank', bank_path, data=bank_entry, codes=(200,))
+        api('bank', bank_path, data=dict(bank_entry, amount_minor=702), codes=(409,))
+        proposal = api('finance', payout_path + '/prepare-close', data={'bank_entry_id':bank_id})
+        require(proposal['status'] == 'prepared' and proposal['proposal_id'], 'Missing approval payload')
+        approve = {'proposal_id':proposal['proposal_id']}
+        api('finance', payout_path + '/approve-close', data=approve, codes=(403,))
+        api('reviewer', payout_path + '/approve-close', data={'proposal_id':digest('stale')}, codes=(409,))
+        approved = api('reviewer', payout_path + '/approve-close', data=approve)
+        api('reviewer', payout_path + '/approve-close', data=approve)
+        require(approved['status'] == 'matched' and approved['prepared_by'] != approved['approved_by'],
+                'Missing independent close evidence')
+        through = 0
+        cursor = 0
+        entries = []
+        while True:
+            query = {'after':cursor, 'limit':2}
+            if through:
+                query['through'] = through
+            page = self.merchant(p, '/v1/journal?' + urlencode(query))
+            through = page['through_sequence']
+            entries.extend(page['entries'] or [])
+            if not page['entries'] or entries[-1]['sequence'] >= through:
+                break
+            new_cursor = page['next_after']
+            require(new_cursor > cursor, 'Journal cursor failed to advance')
+            cursor = new_cursor
+        refs = {terminal['reference'],hosted['reference'],refund['reference'],*fee_refs,payout,bank_id}
+        selected = [entry for entry in entries if entry['reference'] in refs]
+        balances = Counter()
+        kinds = Counter()
+        for item in selected:
+            require(item['merchant_id'] == p.merchant and item['processor_account'] == p.account, 'Foreign ledger entry')
+            legs = item['legs']
+            require(sum(leg['debit_minor'] for leg in legs) == sum(leg['credit_minor'] for leg in legs), 'Unbalanced group')
+            for leg in legs:
+                balances[leg['account']] += leg['debit_minor'] - leg['credit_minor']
+            kinds[item['kind']] += 1
+        require(kinds['capture'] == 2 and kinds['refund'] == 1 and kinds['fee'] == 2,
+                f'Duplicate or missing money movements: {dict(kinds)}')
+        require({key:v for key,v in balances.items() if v} == {'observed_merchant_bank':701,'merchant_proceeds':-701},
+                f'Independently recomputed journal balances differ: {dict(balances)}')
+        print('PASS original frozen acquirer remittance: 15.34 gross - 8.00 refund - 0.33 fees = 7.01; independent bank fixture and separate close approver; clearing and transit returned to zero', flush=True)
+
+
+def processor_postings(state, port):
+    # This is an independent read-only SQL session in the disposable processor DB.
+    # The outer supplier/merchant fixture credentials never enter the application.
+    pg = os.environ.get('DAKIM_PG_BIN')
+    exe = Path(pg) / 'psql' if pg else shutil.which('psql')
+    if not exe:
+        exe = Path(subprocess.check_output(['pg_config','--bindir'],text=True).strip()) / 'psql'
+    secrets = json.loads((state/'provisioning.json').read_text())
+    env = {**os.environ, 'PGPASSWORD':secrets['db']['virtual-acquirer'],
+           'PGOPTIONS':'-c default_transaction_read_only=on'}
+    result = subprocess.run([str(exe),'-XqAt','-v','ON_ERROR_STOP=1','-h','127.0.0.1','-p',str(port),
+                             '-U','dg_acquirer','-d','dg_acquirer',
+                             '-c','SELECT merchant,currency,kind,amount,operation_id,reference FROM virtualrail.movement'],
+                            check=True,capture_output=True,text=True,env=env)
+    return sorted(tuple(line.split('|')) for line in result.stdout.splitlines())
+
+
+def check_processor_postings(state, port, merchant, currency, terminal, hosted, refund):
+    observed = processor_postings(state, port)
+    wanted = sorted((merchant,currency,kind,str(amount),row['operation_id'],row['reference'])
+                    for kind,amount,row in [('capture',1234,terminal),('capture',300,hosted),('refund',-800,refund)])
+    require(observed == wanted, 'Independent processor postings differ from the gateway journal')
+    print('PASS independent processor tables contain exactly two capture movements and one original refund', flush=True)
+
+
+def free_ports(n):
+    with contextlib.ExitStack() as stack:
+        sockets = [stack.enter_context(socket.socket()) for _ in range(n)]
+        for s in sockets:
+            s.bind(('127.0.0.1',0))
+        return [s.getsockname()[1] for s in sockets]
+
+
+def run():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--keep-state', action='store_true',
+                        help='Preserve the private disposable fixture after testing; stop its processes.')
+    parser.add_argument('--concurrency', action='store_true',
+                        help='Run the bounded two-merchant hosted concurrency and reconciliation workload.')
+    options = parser.parse_args()
+    launcher = Path(__file__).resolve().with_name('gateway-local')
+    with contextlib.ExitStack() as stack:
+        if options.keep_state:
+            state = Path(tempfile.mkdtemp(prefix='dakim-gateway-verify-'))
+        else:
+            state = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix='dakim-gateway-verify-')))
+        gp, rp, pp = free_ports(3)
+        env = {**os.environ, 'DAKIM_GATEWAY_STATE':str(state), 'DAKIM_GATEWAY_PORT':str(gp),
+               'DAKIM_RAIL_PORT':str(rp), 'DAKIM_GATEWAY_PG_PORT':str(pp)}
+        def local(action):
+            subprocess.run([launcher, action], env=env, check=True, stdout=subprocess.DEVNULL, timeout=240)
+        stack.callback(local, 'stop')
+        local('start')
+        fixture = json.loads((state/'clients.json').read_text())
+        connector = json.loads((state/'rail.json').read_text())['rail_token']
+        a, b = (Party(**settings) for settings in fixture['merchants'])
+        @contextlib.contextmanager
+        def stop_and_recover():
+            pid = int((state/'gateway.pid').read_text())
+            process = subprocess.run(['ps','-ww','-p',str(pid),'-o','command='],text=True,capture_output=True,check=True)
+            require(process.stdout.strip() == f"{state}/dakim-gateway gateway", 'Unexpected gateway process identity')
+            os.kill(pid, signal.SIGKILL)
+            def stopped():
+                with socket.socket() as sock:
+                    sock.settimeout(1)
+                    return sock.connect_ex(('127.0.0.1',gp)) != 0
+            try:
+                wait('gateway port to close after process termination', stopped)
+                yield
+            finally:
+                local('start-gateway')
+        test = Verification(fixture['gateway_url'],fixture['rail_url'],connector,a,b,stop_and_recover)
+        if options.concurrency:
+            from gateway_concurrency import verify_concurrency
+            verify_concurrency(test, lambda: processor_postings(state, pp))
+            if options.keep_state:
+                print('Disposable verification state retained at', state)
+            return
+        capture, foreign = test.verify_terminal()
+        print('PASS independent acquirer captured while gateway was stopped; recovery retrieved original movement after restart', flush=True)
+        hosted = test.verify_hosted()
+        refund = test.verify_refund(capture)
+        test.verify_finance(capture,hosted,refund)
+        test.verify_events(foreign)
+        check_processor_postings(state, pp, a.merchant, a.currency, terminal=capture, hosted=hosted, refund=refund)
+        if options.keep_state:
+            print('Disposable verification state retained at', state)
+        print('PASS gateway acceptance complete', flush=True)
+
+
+if __name__ == '__main__':
+    run()

@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Run the virtual-register browser regression against fresh local services."""
+from contextlib import ExitStack
+import os
+from pathlib import Path
+import socket
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parents[1]
+launcher = root / "scripts" / "gateway-local"
+with tempfile.TemporaryDirectory(prefix="dakimpay-browser-") as state:
+    env = dict(os.environ, DAKIM_GATEWAY_STATE=state)
+    with ExitStack() as stack:
+        for name in ("DAKIM_GATEWAY_PORT", "DAKIM_RAIL_PORT", "DAKIM_GATEWAY_PG_PORT"):
+            sock = stack.enter_context(socket.socket())
+            sock.bind(("127.0.0.1", 0))
+            env[name] = str(sock.getsockname()[1])
+    try:
+        subprocess.run([launcher, "start"], env=env, check=True)
+        subprocess.run(["node", root / "scripts" / "gateway_browser.cjs"], env=env, check=True)
+    finally:
+        subprocess.run([launcher, "stop"], env=env, check=True)

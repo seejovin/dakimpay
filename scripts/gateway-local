@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""Run the merchant gateway and independent virtual acquirer on loopback."""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import secrets
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import quote, urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
+import webbrowser
+
+
+from aggregator_fixture import PROVIDERS, PORTS, configure as configure_aggregate, new_secrets
+
+AGGREGATE = os.getenv("DAKIM_LOCAL_TOPOLOGY", "single") == "aggregator"
+ROLES = (*PROVIDERS, "gateway") if AGGREGATE else ("virtual-acquirer", "gateway")
+READER = "card-primary" if AGGREGATE else "virtual-acquirer"
+CLIENT_ROLES = ("merchant", "statement", "bank", "finance", "reviewer")
+DB_ROLES = {"gateway": "dg_gateway", "virtual-acquirer": "dg_acquirer",
+            **{name: "dg_" + name.replace("-", "_") for name in PROVIDERS}}
+REPO = Path(__file__).resolve().parents[1]
+STATE = Path(os.getenv("DAKIM_GATEWAY_STATE", "~/.local/share/dakim-gateway")).expanduser().resolve()
+PG = STATE / "postgres"
+BINARY = STATE / "dakim-gateway"
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args):
+        return None
+
+
+LOCAL_HTTP = build_opener(ProxyHandler({}), NoRedirect())
+
+
+def require_private(path):
+    st = path.lstat()
+    if st.st_uid != os.getuid() or st.st_mode & 0o077 or stat.S_ISLNK(st.st_mode):
+        sys.exit(f"Require a private file or directory owned by the current user: {path}")
+
+
+def write_private(path, text):
+    with tempfile.NamedTemporaryFile(mode="w", dir=STATE, delete=False) as f:
+        try:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+            f.close()
+            os.replace(f.name, path)
+            fd = os.open(STATE, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(f.name)
+
+
+def env_port(name, default):
+    try:
+        p = int(os.environ.get(name, default))
+        if not 1 <= p <= 65535:
+            raise ValueError
+        return p
+    except ValueError:
+        sys.exit(f"Invalid port for {name}")
+
+
+def local_binding():
+    metadata = STATE / "binding.json"
+    saved = {}
+    if metadata.exists():
+        require_private(metadata)
+        saved = json.loads(metadata.read_text())
+    result = {}
+    if saved and (saved.get("topology") == "aggregator") != AGGREGATE:
+        sys.exit("This state directory belongs to a different payment topology. Use its original launcher.")
+    ports = (("gateway", "DAKIM_GATEWAY_PORT", 8480), *PORTS, ("postgres", "DAKIM_GATEWAY_PG_PORT", 55595)) if AGGREGATE else (
+        ("gateway", "DAKIM_GATEWAY_PORT", 8470), ("virtual-acquirer", "DAKIM_RAIL_PORT", 8471),
+        ("postgres", "DAKIM_GATEWAY_PG_PORT", 55594))
+    for key, name, fallback in ports:
+        result[key] = env_port(name, saved.get(key, fallback))
+    if len(set(result.values())) != len(ports):
+        sys.exit("Every local service and PostgreSQL require different ports.")
+    if AGGREGATE:
+        result["topology"] = "aggregator"
+    name = os.getenv("DAKIM_SPANNER_DATABASE", saved.get("spanner", ""))
+    endpoint = os.getenv("SPANNER_EMULATOR_HOST", saved.get("emulator", "")) if name else ""
+    if name:
+        try:
+            u = urlsplit("//" + endpoint)
+            if (u.hostname != "127.0.0.1" or not u.port or u.netloc != f"127.0.0.1:{u.port}"
+                    or u.path or u.query or u.fragment):
+                raise ValueError
+        except ValueError:
+            sys.exit("Spanner mode requires SPANNER_EMULATOR_HOST=127.0.0.1:PORT.")
+        parts = name.split("/")
+        if len(parts) != 6 or parts[::2] != ["projects", "instances", "databases"] or not all(parts[1::2]):
+            sys.exit("Invalid Spanner database resource name.")
+    result.update(spanner=name, emulator=endpoint)
+    if saved and result != saved:
+        sys.exit("State is bound to different ports or databases. Use its original settings or a new state directory.")
+    return result
+
+
+def url(settings, role):
+    return f"http://127.0.0.1:{settings[role]}"
+
+
+def provision(settings):
+    path = STATE / "provisioning.json"
+    if path.exists():
+        require_private(path)
+        keys = json.loads(path.read_text())
+    else:
+        if (PG / "PG_VERSION").exists() or (STATE / "clients.json").exists():
+            sys.exit("Existing installation is missing its credential store. Restore it before starting.")
+        ids = ("mimi", "market-two")
+        keys = new_secrets(ids, CLIENT_ROLES) if AGGREGATE else {"rail": secrets.token_urlsafe(36), "admin": secrets.token_hex(32),
+                "db": {k: secrets.token_hex(32) for k in ROLES},
+                "merchants": {m: {key: secrets.token_urlsafe(36) for key in (*CLIENT_ROLES, "device", "export")} for m in ids}}
+        write_private(path, json.dumps(keys))
+    if AGGREGATE:
+        configure_aggregate(settings, STATE, keys, write_private, require_private, url)
+        return keys
+    # Upgrade private local installations while retaining previously issued keys.
+    missing = [v for v in keys["merchants"].values() if "export" not in v]
+    for values in missing:
+        values["export"] = secrets.token_urlsafe(36)
+    if missing:
+        write_private(path, json.dumps(keys))
+    gateway = {"origin": url(settings, "gateway"), "rail_origin": url(settings, "virtual-acquirer"),
+               "rail_token": keys["rail"], "programs": [], "credentials": []}
+    subscriptions = STATE / "subscriptions.json"
+    if subscriptions.exists():
+        require_private(subscriptions)
+        gateway["subscriptions"] = json.loads(subscriptions.read_text())
+    rail = {"origin": gateway["rail_origin"], "rail_token": keys["rail"], "programs": []}
+    clients = {"gateway_url": gateway["origin"], "rail_url": rail["origin"], "merchants": []}
+    for index, merchant in enumerate(("mimi", "market-two"), start=1):
+        values = keys["merchants"][merchant]
+        base = {"merchant": merchant, "account": "acct-" + merchant, "currency": "USD",
+                "max_amount": 1000000, "outlets": ["store-1"]}
+        terminal = f"terminal-{index}"
+        bank = "bank-" + merchant
+        gateway["programs"].append({**base, "beneficiary": bank, "terminals": {terminal: "store-1"}})
+        rail["programs"].append({**base, "beneficiary": bank, "statement_token": values["export"], "terminals": [{"id": terminal, "outlet": "store-1",
+                                                        "token": values["device"]}]})
+        for role in CLIENT_ROLES:
+            gateway["credentials"].append({"merchant": merchant, "role": role, "subject": f"{merchant}-{role}",
+                                          "sha256": hashlib.sha256(values[role].encode()).hexdigest()})
+        clients["merchants"].append({"merchant": merchant, "account": base["account"], "currency": "USD",
+                                     "beneficiary": bank, "outlet": "store-1", "terminal": terminal,
+                                     "device_token": values["device"], "rail_statement_token": values["export"], "tokens": {r: values[r] for r in CLIENT_ROLES}})
+    for name, config in (("gateway", gateway), ("rail", rail), ("clients", clients), ("binding", settings)):
+        write_private(STATE / (name + ".json"), json.dumps(config, indent=2) + "\n")
+    return keys
+
+
+def pg_tools():
+    if os.getenv("DAKIM_PG_BIN"):
+        candidate = Path(os.environ["DAKIM_PG_BIN"])
+    elif shutil.which("pg_config"):
+        candidate = Path(subprocess.check_output(["pg_config", "--bindir"], text=True).strip())
+    elif shutil.which("initdb"):
+        candidate = Path(shutil.which("initdb")).parent
+    else:
+        sys.exit("Install PostgreSQL server/client tools or set DAKIM_PG_BIN.")
+    if any(not (candidate / x).is_file() for x in ("initdb", "pg_ctl", "psql")):
+        sys.exit("DAKIM_PG_BIN must contain initdb, pg_ctl and psql.")
+    return candidate
+
+
+def stop_pg():
+    if (PG / "postmaster.pid").exists():
+        subprocess.run([pg_tools() / "pg_ctl", "-D", PG, "-m", "fast", "-w", "stop"],
+                       stdout=subprocess.DEVNULL, check=True)
+
+
+def prepare_pg(settings, keys):
+    b = pg_tools()
+    pg_env = {k: v for k, v in os.environ.items() if not k.startswith("PG")}
+    if not (PG / "PG_VERSION").exists():
+        pwfile = STATE / ".init-password"
+        write_private(pwfile, keys["admin"] + "\n")
+        try:
+            subprocess.run([b / "initdb", "-D", PG, "-U", "dg_admin", "--pwfile", pwfile,
+                            "--auth-host=scram-sha-256", "--auth-local=scram-sha-256",
+                            "--no-locale", "-E", "UTF8"], env=pg_env, check=True, stdout=subprocess.DEVNULL)
+        finally:
+            pwfile.unlink(missing_ok=True)
+    if subprocess.run([b / "pg_ctl", "-D", PG, "status"], env=pg_env, stdout=subprocess.DEVNULL).returncode:
+        subprocess.run([b / "pg_ctl", "-D", PG, "-l", STATE / "postgres.log", "-w", "-o",
+                        f"-p {settings['postgres']} -c listen_addresses=127.0.0.1 -c unix_socket_directories=''",
+                        "start"], env=pg_env, check=True, stdout=subprocess.DEVNULL)
+    args = [b / "psql", "-XqAtw", "-h", "127.0.0.1", "-p", str(settings["postgres"]),
+            "-U", "dg_admin", "-d", "postgres", "-v", "ON_ERROR_STOP=1"]
+    def sql(statement):
+        result = subprocess.run(args, input=statement, env={**pg_env, "PGPASSWORD": keys["admin"]},
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode:
+            sys.exit("Private PostgreSQL provisioning failed. Check database state and its owner.")
+        return result.stdout.strip()
+    if Path(sql("SHOW data_directory")).resolve() != PG.resolve():
+        sys.exit("Unexpected PostgreSQL server data directory.")
+    sql("REVOKE CONNECT ON DATABASE postgres,template1 FROM PUBLIC;")
+    for role in ROLES:
+        name = DB_ROLES[role]
+        if not sql(f"SELECT 1 FROM pg_roles WHERE rolname='{name}'"):
+            sql(f"CREATE ROLE {name} LOGIN PASSWORD '{keys['db'][role]}';")
+        if not sql(f"SELECT 1 FROM pg_database WHERE datname='{name}'"):
+            sql(f"CREATE DATABASE {name} OWNER {name};")
+        sql(f"REVOKE CONNECT ON DATABASE {name} FROM PUBLIC; GRANT CONNECT ON DATABASE {name} TO {name};")
+
+
+def program(role):
+    if AGGREGATE and role in PROVIDERS:
+        return STATE / ("provider-" + role), "virtual-acquirer"
+    return BINARY, role
+
+
+def pid_for(role):
+    path = STATE / (role + ".pid")
+    if not path.is_file():
+        return None
+    require_private(path)
+    try:
+        pid = int(path.read_text())
+    except ValueError:
+        sys.exit(f"Invalid PID in {path}")
+    if pid < 2:
+        return None
+    # Match the installation path and role, so stale PID files cannot target an unrelated process.
+    ps = subprocess.run(["ps", "-ww", "-p", str(pid), "-o", "command="], text=True, capture_output=True)
+    exe, arg = program(role)
+    return pid if ps.returncode == 0 and ps.stdout.strip() == f"{exe} {arg}" else None
+
+
+def healthy(settings, role):
+    try:
+        with LOCAL_HTTP.open(url(settings, role) + "/health", timeout=0.4) as res:
+            if res.status != 200:
+                return False
+            body = res.read(1025)
+            return len(body) <= 1024 and json.loads(body) == {"ok": True, "service": program(role)[1], "mode": "virtual"}
+    except (OSError, ValueError):
+        return False
+
+
+def stop_service(role):
+    pid = pid_for(role)
+    if pid:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGTERM)
+        deadline = time.monotonic() + 12
+        while pid_for(role) and time.monotonic() < deadline:
+            time.sleep(.08)
+        if pid_for(role):
+            sys.exit(f"{role} has not stopped. Its PID and state were retained.")
+    (STATE / (role + ".pid")).unlink(missing_ok=True)
+
+
+def build():
+    source = os.getenv("DAKIM_GATEWAY_BIN")
+    dest = STATE / ".dakim-gateway.next"
+    try:
+        if source:
+            shutil.copyfile(Path(source).resolve(), dest)
+            dest.chmod(0o700)
+        else:
+            subprocess.run(["go", "build", "-trimpath", "-o", dest, "./cmd/dakim-gateway"], cwd=REPO, check=True)
+        dest.replace(BINARY)
+        if AGGREGATE:
+            for name in PROVIDERS:
+                alias, _ = program(name)
+                if alias.is_symlink() and os.readlink(alias) == BINARY.name:
+                    continue
+                alias.symlink_to(BINARY.name)
+    finally:
+        dest.unlink(missing_ok=True)
+
+
+def service_env(role, settings, keys):
+    env = {k: v for k, v in os.environ.items() if k in {"HOME", "PATH", "LANG", "TMPDIR", "TZ"}}
+    env["NO_PROXY"] = "127.0.0.1,localhost"
+    env["DAKIM_GATEWAY_CONFIG"] = str(STATE / ((role if AGGREGATE or role == "gateway" else "rail") + ".json"))
+    if role == "gateway" and settings["spanner"]:
+        env["DAKIM_SPANNER_DATABASE"] = settings["spanner"]
+        env["SPANNER_EMULATOR_HOST"] = settings["emulator"]
+    else:
+        name = DB_ROLES[role]
+        env["DAKIM_DB"] = (f"postgresql://{name}:{keys['db'][role]}@127.0.0.1:{settings['postgres']}/{name}"
+                           "?sslmode=disable")
+    return env
+
+
+def start_service(role, settings, keys):
+    if pid_for(role):
+        if not healthy(settings, role):
+            sys.exit(f"{role} is running but unhealthy. Inspect {STATE / (role + '.log')}")
+        return False
+    with socket.socket() as sock:
+        if sock.connect_ex(("127.0.0.1", settings[role])) == 0:
+            sys.exit(f"Port {settings[role]} belongs to another process.")
+    env = service_env(role, settings, keys)
+    if role == "gateway":
+        subprocess.run([BINARY, "migrate"], env=env, check=True)
+    with (STATE / (role + ".log")).open("ab") as log:
+        proc = subprocess.Popen(list(program(role)), env=env, stdin=subprocess.DEVNULL, stdout=log,
+                                stderr=log, start_new_session=True)
+    write_private(STATE / (role + ".pid"), str(proc.pid) + "\n")
+    deadline = time.monotonic() + 30
+    while proc.poll() is None and time.monotonic() < deadline:
+        if healthy(settings, role):
+            return True
+        time.sleep(.12)
+    stop_service(role)
+    sys.exit(f"{role} did not become ready. Inspect {STATE / (role + '.log')}")
+
+
+def start(settings, selected):
+    running = [r for r in ROLES if pid_for(r)]
+    if not running or not BINARY.exists():
+        build()
+    keys = provision(settings)
+    pg_was_running = (PG / "postmaster.pid").is_file()
+    started = []
+    try:
+        prepare_pg(settings, keys)
+        for role in selected:
+            if start_service(role, settings, keys):
+                started.append(role)
+    except (Exception, SystemExit, KeyboardInterrupt):
+        for role in reversed(started):
+            stop_service(role)
+        if not pg_was_running:
+            stop_pg()
+        raise
+    print(f"Virtual gateway at {url(settings, 'gateway')} · terminal at {url(settings, READER)}/terminal")
+    launcher = "aggregator-local" if AGGREGATE else "gateway-local"
+    print(f"Run scripts/{launcher} open to open the authenticated merchant and reader screens.")
+
+
+def main():
+    cli = argparse.ArgumentParser(description=__doc__)
+    cli.add_argument("action", choices=["start", "stop", "start-gateway", "stop-gateway", "restart-gateway", "status", "open", "start-provider", "stop-provider"])
+    cli.add_argument("provider", nargs="?", choices=list(PROVIDERS))
+    args = cli.parse_args()
+    cmd = args.action
+    if ((cmd in ("stop-provider", "start-provider")) != bool(args.provider)) or (args.provider and not AGGREGATE):
+        cli.error("Provider controls require aggregator-local start-provider|stop-provider PROVIDER")
+    os.umask(0o077)
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    require_private(STATE)
+    with (STATE / ".launcher.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        settings = local_binding()
+        if cmd == "start":
+            start(settings, ROLES)
+        elif cmd == "stop":
+            for role in reversed(ROLES):
+                stop_service(role)
+            stop_pg()
+        elif cmd == "stop-provider":
+            stop_service(args.provider)
+        elif cmd == "start-provider":
+            start(settings, [args.provider])
+        elif cmd == "stop-gateway":
+            stop_service("gateway")
+        elif cmd in ("start-gateway", "restart-gateway"):
+            if not AGGREGATE and (not pid_for(READER) or not healthy(settings, READER)):
+                sys.exit("The virtual acquirer is not running. Use scripts/gateway-local start.")
+            if cmd == "restart-gateway":
+                stop_service("gateway")
+            start(settings, ["gateway"])
+        elif cmd == "status":
+            for role in ROLES:
+                print(role, "running" if pid_for(role) and healthy(settings, role) else "stopped or unhealthy",
+                      url(settings, role))
+        elif cmd == "open":
+            if not all(pid_for(r) and healthy(settings, r) for r in ROLES):
+                sys.exit("Start the gateway and virtual acquirer first.")
+            path = STATE / "clients.json"
+            require_private(path)
+            clients = json.loads(path.read_text())
+            first = clients["merchants"][0]
+            for target, token in ((clients["gateway_url"] + "/", first["tokens"]["merchant"]),
+                                  (clients["rail_url"] + "/terminal", first["device_token"])):
+                if not webbrowser.open_new_tab(target + "#token=" + quote(token, safe="")):
+                    sys.exit(f"No browser available. Use the local URL and matching credential from {path}.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        sys.exit(f"Gateway launcher failed: {exc}")

@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Run a command against a fresh, private Google Cloud Spanner emulator database."""
+from contextlib import ExitStack, suppress
+import json
+import os
+from pathlib import Path
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.error import URLError
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+REPO = Path(__file__).resolve().parents[1]
+INSTANCE = "projects/dakim-local/instances/gateway"
+DATABASE = INSTANCE + "/databases/gateway"
+IMAGE = "gcr.io/cloud-spanner-emulator/emulator:1.5.59"
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args):
+        return None
+
+
+def ports():
+    with ExitStack() as stack:
+        sockets = [stack.enter_context(socket.socket()) for _ in range(2)]
+        for sock in sockets:
+            sock.bind(("127.0.0.1", 0))
+        return [sock.getsockname()[1] for sock in sockets]
+
+
+def emulator_command(grpc, rest, name):
+    directory = os.getenv("DAKIM_SPANNER_EMULATOR_BIN")
+    if directory:
+        path = Path(directory).resolve()
+        if not all(os.access(path / f, os.X_OK) for f in ("emulator_main", "gateway_main")):
+            sys.exit("DAKIM_SPANNER_EMULATOR_BIN must contain Google's emulator_main and gateway_main.")
+        env = dict(os.environ)
+        env["LD_LIBRARY_PATH"] = str(path) + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+        return ([path / "gateway_main", "-hostname", "127.0.0.1", "-grpc_port", str(grpc),
+                 "-http_port", str(rest), "-grpc_binary", path / "emulator_main"], env, False)
+    if not shutil.which("docker"):
+        sys.exit("Install Docker or set DAKIM_SPANNER_EMULATOR_BIN to the extracted Google emulator directory.")
+    endpoint = os.getenv("DOCKER_HOST") or subprocess.check_output(
+        ["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"], text=True).strip()
+    if not endpoint.startswith("unix://"):
+        sys.exit("The qualification emulator requires a local Docker engine.")
+    local = {key: value for key, value in os.environ.items() if key not in ("DOCKER_CONTEXT", "DOCKER_HOST")}
+    docker = ["docker", "--host", endpoint]
+    return ([*docker, "run", "--rm", "--name", name, "-p", f"127.0.0.1:{grpc}:9010",
+             "-p", f"127.0.0.1:{rest}:9020", IMAGE], local, docker)
+
+
+def initialize(port, process):
+    http = build_opener(ProxyHandler({}), NoRedirect())
+    base = f"http://127.0.0.1:{port}/v1/"
+    def call(method, path, body=None):
+        request = Request(base + path, method=method,
+                          data=None if body is None else json.dumps(body).encode(),
+                          headers={"Content-Type": "application/json"})
+        with http.open(request, timeout=6) as response:
+            return json.load(response)
+    def complete(operation):
+        deadline = time.monotonic() + 30
+        while not operation.get("done"):
+            if time.monotonic() > deadline:
+                raise RuntimeError("Spanner emulator provisioning timed out.")
+            time.sleep(0.1)
+            operation = call("GET", operation["name"])
+        if operation.get("error"):
+            raise RuntimeError("Spanner emulator provisioning failed: " + str(operation["error"]))
+    deadline = time.monotonic() + 180
+    while True:
+        if process.poll() is not None:
+            raise RuntimeError("The Spanner emulator exited during startup.")
+        try:
+            call("GET", "projects/dakim-local/instanceConfigs")
+            break
+        except (OSError, URLError):
+            if time.monotonic() > deadline:
+                raise RuntimeError("Timed out waiting for the local Spanner emulator.")
+            time.sleep(0.15)
+    complete(call("POST", "projects/dakim-local/instances", {"instanceId": "gateway", "instance": {
+        "name": INSTANCE, "config": "projects/dakim-local/instanceConfigs/emulator-config",
+        "displayName": "dakim local qualification", "nodeCount": 1}}))
+    ddl = (REPO / "internal/gwstore/spanner.sql").read_text().strip().rstrip(";")
+    complete(call("POST", INSTANCE + "/databases", {"createStatement": "CREATE DATABASE gateway",
+                                                     "extraStatements": [ddl]}))
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit("Usage: scripts/with-spanner-emulator COMMAND [ARG ...]")
+    grpc, rest = ports()
+    container = "dakim-qual-" + secrets.token_hex(8)
+    command, env, docker = emulator_command(grpc, rest, container)
+    with tempfile.TemporaryFile() as log:
+        child = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL, stdout=log,
+                                 stderr=log, start_new_session=True)
+        try:
+            initialize(rest, child)
+            config = {**os.environ, "SPANNER_EMULATOR_HOST": f"127.0.0.1:{grpc}",
+                      "DAKIM_SPANNER_DATABASE": DATABASE, "DAKIM_TEST_SPANNER_DATABASE": DATABASE,
+                      "NO_PROXY": "127.0.0.1,localhost," + os.getenv("NO_PROXY", "")}
+            config["no_proxy"] = config["NO_PROXY"]
+            return subprocess.run(sys.argv[1:], env=config).returncode
+        except Exception:
+            log.seek(max(0, log.seek(0, 2) - 3000))
+            print(log.read().decode(errors="replace"), file=sys.stderr)
+            raise
+        finally:
+            if docker:
+                subprocess.run([*docker, "rm", "-f", container], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with suppress(ProcessLookupError):
+                os.killpg(child.pid, signal.SIGTERM)
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                with suppress(ProcessLookupError):
+                    os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    try:
+        sys.exit(main())
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
+        sys.exit(str(exc))
